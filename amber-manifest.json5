@@ -1,0 +1,39 @@
+{
+  manifest_version: "0.1.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      OPENAI_API_KEY: { type: "string", secret: true },
+      TAU2_AGENT_LLM: { type: "string", secret: false },
+      TAU2_AGENT_TEMPERATURE: { type: "string", secret: false },
+    },
+    required: ["OPENAI_API_KEY"],
+    additionalProperties: false,
+  },
+
+  slots: {},
+
+  program: {
+    image: "ghcr.io/theycallmemax/agentx-tau2-purple:latest",
+    entrypoint: "uv run src/server.py --host 0.0.0.0 --port 9009",
+
+    env: {
+      OPENAI_API_KEY: "${config.OPENAI_API_KEY}",
+      TAU2_AGENT_LLM: "${config.TAU2_AGENT_LLM}",
+      TAU2_AGENT_TEMPERATURE: "${config.TAU2_AGENT_TEMPERATURE}",
+    },
+
+    network: {
+      endpoints: [
+        { name: "a2a_endpoint", port: 9009 },
+      ],
+    },
+  },
+
+  provides: {
+    a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
+  },
+
+  exports: { a2a: "a2a" },
+}
