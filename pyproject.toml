@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentbeats-tau2-purple"
+version = "0.1.0"
+description = "Improved tau2 purple agent for AgentX / AgentBeats"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "a2a-sdk[http-server]>=0.3.20",
+  "httpx>=0.28.1",
+  "litellm>=1.81.11",
+  "python-dotenv>=1.0.1",
+  "uvicorn>=0.38.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.24.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
