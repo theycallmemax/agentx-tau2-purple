@@ -4,9 +4,9 @@
   config_schema: {
     type: "object",
     properties: {
-      OPENAI_API_KEY: { type: "string", secret: true },
+      openai_api_key: { type: "string", secret: true },
     },
-    required: ["OPENAI_API_KEY"],
+    required: ["openai_api_key"],
     additionalProperties: false,
   },
 
@@ -17,7 +17,7 @@
     entrypoint: "uv run src/server.py --host 0.0.0.0 --port 9009",
 
     env: {
-      OPENAI_API_KEY: "${config.OPENAI_API_KEY}",
+      OPENAI_API_KEY: "${config.openai_api_key}",
       TAU2_AGENT_LLM: "openai/gpt-4o-mini",
       TAU2_AGENT_TEMPERATURE: "0",
     },
