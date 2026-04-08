@@ -42,16 +42,34 @@ Hard rules:
 - Never invent tool results or claim success before a tool result confirms it.
 - Prefer reading state before mutating it when the situation is uncertain.
 - If policy blocks a request, refuse it clearly using "respond".
-- In troubleshooting situations, especially telecom, guide the user one concrete step at a time when a user-side step is required.
 - Keep direct user responses concise and operational.
 - Before any mutating action, re-check the relevant policy constraint against verified facts.
 - Internally decompose multi-part requests into a checklist and avoid ending while important items remain unresolved.
+- Before any write action (book, modify, cancel), list the exact details and obtain explicit user confirmation (yes) before calling the API.
 
-Airline-specific guardrails that often matter:
-- Do not proactively offer compensation unless the user asks for it.
+Airline-specific guardrails:
+- Do not proactively offer compensation unless the user explicitly asks for it.
 - Do not trust user claims about eligibility, membership tier, insurance, or flight status without tool verification.
 - If the user wants a change that policy clearly forbids, refuse clearly instead of improvising or transferring.
 - Do not ask the user for reservation ids or airport codes if the evaluator context or tools can resolve them.
+
+COMPENSATION RULES (verify before any send_certificate call):
+- ELIGIBLE: silver or gold member; OR travel_insurance=yes; OR business cabin.
+- NOT ELIGIBLE: regular member AND travel_insurance=no AND cabin is economy or basic_economy.
+- Cancelled flight: certificate = $100 × number of passengers.
+- Delayed flight (only when user is ALSO changing or cancelling): certificate = $50 × number of passengers.
+- No compensation for any other reason.
+
+CANCELLATION RULES:
+- If ANY flight in the reservation has already been flown → call transfer_to_human_agents immediately.
+- Cancellation is allowed if: booked within 24 hrs; OR airline cancelled; OR business cabin; OR travel insurance covers reason (weather/health).
+- Always obtain and verify the cancellation reason before calling cancel_reservation.
+
+MODIFICATION RULES:
+- basic_economy cabin: flights CANNOT be changed. Cabin CAN be changed.
+- Cabin change: NOT allowed if any flight has already been flown.
+- Bags: can add, cannot remove. Insurance: cannot add after booking.
+- Passengers: can modify details, cannot change count.
 """
 
 THINK_PROMPT = """Plan the next move carefully.
@@ -101,6 +119,11 @@ class SessionState:
     last_user_details: dict[str, Any] | None = None
     last_reservation_details: dict[str, Any] | None = None
     recent_tool_payloads: list[dict[str, Any]] = field(default_factory=list)
+    # Confirmation gate: write action waiting for user "yes"
+    pending_write_action: dict[str, Any] | None = None
+    pending_write_summary: str | None = None
+    # Transfer flow: must send "PLEASE HOLD ON" on the next turn
+    just_transferred: bool = False
 
 
 USER_ID_PATTERN = re.compile(r"\b[a-z]+_[a-z]+_\d{3,}\b")
@@ -195,6 +218,8 @@ class Agent:
         self.allowed_action_names: set[str] | None = None
         self.turn_count = 0
         self.state = SessionState()
+        # Bypass confirmation gate when re-executing an already-confirmed write action
+        self._confirmation_bypass = False
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         input_text = get_message_text(message)
@@ -235,6 +260,11 @@ class Agent:
         )
 
         action_json = self._generate_action(input_text, reasoning)
+
+        # Track transfer so we send the required hold message on the next turn
+        if action_json.get("name") == "transfer_to_human_agents":
+            self.state.just_transferred = True
+
         assistant_content = json.dumps(action_json, ensure_ascii=False)
         self.messages.append({"role": "assistant", "content": assistant_content})
 
@@ -282,10 +312,48 @@ class Agent:
                 temperature=self.temperature,
             )
             return completion.choices[0].message.content or ""
-        except Exception:
+        except Exception as e:
+            print(f"[tau2-agent] THINK call failed: {e}")
             return ""
 
+    def _is_user_confirmation(self, text: str) -> bool:
+        lowered = text.lower().strip()
+        confirm_tokens = ("yes", "yeah", "yep", "confirm", "proceed", "go ahead", "ok", "okay", "sure", "please do", "do it")
+        return any(lowered == t or lowered.startswith(t + " ") or lowered.startswith(t + ",") for t in confirm_tokens)
+
+    def _is_user_denial(self, text: str) -> bool:
+        lowered = text.lower().strip()
+        deny_tokens = ("no", "nope", "cancel", "stop", "don't", "do not", "abort", "never mind", "nevermind")
+        return any(lowered == t or lowered.startswith(t + " ") or lowered.startswith(t + ",") for t in deny_tokens)
+
     def _generate_action(self, input_text: str, reasoning: str) -> dict[str, Any]:
+        # Transfer two-step: policy requires sending HOLD message after transfer_to_human_agents
+        if self.state.just_transferred:
+            self.state.just_transferred = False
+            return self._fallback_action(
+                "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
+            )
+
+        # Confirmation gate: if a write action is pending, check user response
+        if self.state.pending_write_action is not None:
+            user_text = self._latest_user_text() or input_text
+            if self._is_user_confirmation(user_text):
+                action = self.state.pending_write_action
+                self.state.pending_write_action = None
+                self.state.pending_write_summary = None
+                self._confirmation_bypass = True
+                try:
+                    result = self._normalize_action(action)
+                finally:
+                    self._confirmation_bypass = False
+                return result
+            elif self._is_user_denial(user_text):
+                self.state.pending_write_action = None
+                self.state.pending_write_summary = None
+                return self._fallback_action(
+                    "Understood, I won't proceed with that action. Is there anything else I can help you with?"
+                )
+
         heuristic_action = self._maybe_rule_based_action(input_text)
         if heuristic_action is not None:
             self._debug("heuristic_action", action=heuristic_action)
@@ -310,7 +378,7 @@ class Agent:
                     ),
                 }
             ]
-            action = self._completion_to_action(retry_messages)
+            action = self._completion_to_action(retry_messages, use_response_format=False)
 
         if action is None:
             return self._fallback_action(
@@ -341,7 +409,8 @@ class Agent:
             return self._maybe_airline_tool_action(normalized_input[5:].strip())
         if self._looks_like_benchmark_prompt(normalized_input):
             return self._maybe_airline_benchmark_action(normalized_input)
-        return None
+        # Subsequent benchmark turns arrive as plain text without prefix — treat as user message
+        return self._maybe_airline_user_action(normalized_input)
 
     def _looks_like_benchmark_prompt(self, input_text: str) -> bool:
         lowered = input_text.lower()
@@ -383,6 +452,9 @@ class Agent:
         hint_text = raw_hint_text.lower()
 
         if not hint_text.strip():
+            # Only greet on a truly cold start; if we already have context let the LLM handle it
+            if self.state.pending_intent is not None or self.state.known_user_id is not None:
+                return None
             return self._fallback_action(
                 "Hello, how can I help you with your flight reservation today?"
             )
@@ -595,18 +667,21 @@ class Agent:
         return None
 
     def _completion_to_action(
-        self, messages: list[dict[str, Any]]
+        self, messages: list[dict[str, Any]], use_response_format: bool = True
     ) -> dict[str, Any] | None:
         raw_content = ""
         try:
-            completion = litellm.completion(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                response_format={"type": "json_object"},
-            )
+            kwargs: dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": self.temperature,
+            }
+            if use_response_format:
+                kwargs["response_format"] = {"type": "json_object"}
+            completion = litellm.completion(**kwargs)
             raw_content = completion.choices[0].message.content or ""
-        except Exception:
+        except Exception as e:
+            print(f"[tau2-agent] ACT call failed (response_format={use_response_format}): {e}")
             return None
 
         return _extract_json_object(raw_content)
@@ -763,8 +838,15 @@ class Agent:
             if item.get("role") != "user":
                 continue
             content = item.get("content")
-            if isinstance(content, str) and content.startswith("user:"):
+            if not isinstance(content, str):
+                continue
+            if content.startswith("user:"):
                 return content[5:].strip()
+            if content.startswith("tool:"):
+                continue
+            # Plain text messages (subsequent benchmark turns sent without prefix)
+            if not self._looks_like_benchmark_prompt(content):
+                return content.strip()
         return None
 
     def _parse_tool_payload(self, tool_text: str) -> dict[str, Any] | None:
@@ -851,8 +933,12 @@ class Agent:
             if item.get("role") != "user":
                 continue
             content = item.get("content")
-            if isinstance(content, str) and content.startswith("user:"):
+            if not isinstance(content, str):
+                continue
+            if content.startswith("user:"):
                 texts.append(content[5:].strip().lower())
+            elif not content.startswith("tool:") and not self._looks_like_benchmark_prompt(content):
+                texts.append(content.strip().lower())
         return "\n".join(texts)
 
     def _ingest_message_into_state(self, input_text: str) -> None:
@@ -894,8 +980,15 @@ class Agent:
                 self.state.known_cancellation_reason = cancellation_reason
             self._refresh_unresolved_slots()
 
+        # Determine the actual user text regardless of prefix format
+        _plain_user_text: str | None = None
         if input_text.startswith("user:"):
-            user_text = input_text[5:].strip()
+            _plain_user_text = input_text[5:].strip()
+        elif not input_text.startswith("tool:") and not self._looks_like_benchmark_prompt(input_text):
+            _plain_user_text = input_text.strip()
+
+        if _plain_user_text is not None:
+            user_text = _plain_user_text
             lowered = user_text.lower()
             routed_intent = self._route_intent(lowered)
             if routed_intent is not None:
@@ -1090,8 +1183,23 @@ class Agent:
             return None
         return per_passenger * passenger_count
 
+    def _is_compensation_eligible(self, user_details: dict[str, Any], reservation: dict[str, Any] | None) -> bool:
+        """Returns True if user is eligible for compensation per policy.
+        Eligible: silver/gold member OR travel_insurance=yes OR business cabin.
+        Ineligible: regular + no insurance + (basic_)economy.
+        """
+        membership = user_details.get("membership", "regular")
+        if membership in ("silver", "gold"):
+            return True
+        if reservation is not None:
+            if reservation.get("insurance") == "yes":
+                return True
+            if reservation.get("cabin") == "business":
+                return True
+        return False
+
     def _maybe_compensation_or_delay_action(self, user_text: str) -> dict[str, Any] | None:
-        lowered = user_text.lower()
+        # Step 1: need user details first
         if self.state.last_user_details is None and self.state.known_user_id:
             return {
                 "name": "get_user_details",
@@ -1099,17 +1207,8 @@ class Agent:
             }
 
         user_details = self.state.last_user_details or {}
-        membership = user_details.get("membership")
-        flight_number = self._extract_flight_number(lowered) or self.state.known_flight_number
-        delay_context = any(
-            token in lowered for token in ("delay", "delayed", "flight hasn't been canceled", "flight has not been canceled")
-        ) or self.state.known_delay_context or flight_number == "HAT045"
 
-        if delay_context and membership == "regular":
-            return self._fallback_action(
-                "I verified your account details. You are a Regular member, not a Gold member, and because you are not changing or canceling this flight I’m not able to offer compensation for this delay under the airline policy."
-            )
-
+        # Step 2: need reservation details to make a full eligibility decision
         reservation = self.state.last_reservation_details
         if reservation is None:
             next_reservation = self._next_reservation_to_review()
@@ -1118,33 +1217,40 @@ class Agent:
                     "name": "get_reservation_details",
                     "arguments": {"reservation_id": next_reservation},
                 }
-            if membership == "regular" and self.state.explicit_compensation_request:
-                return self._fallback_action(
-                    "I verified your account details. You are a Regular member, not a Gold member, and because you are not changing or canceling the reservation I’m not able to offer compensation here under the airline policy."
-                )
+            # No reservation data yet — let LLM decide
             return None
 
-        if "delayed flight" in lowered or flight_number == "HAT045" or "frustrated" in lowered:
-            if flight_number and not self.state.explicit_compensation_request:
-                return self._fallback_action(
-                    "I checked the situation. Since you are not changing or canceling the reservation, I’m not able to offer compensation for this delay."
-                )
-
-        if self.state.explicit_compensation_request:
-            if membership == "regular":
-                return self._fallback_action(
-                    "I verified your account and reservation details. You are a Regular member, not a Gold member, and because you are not changing or canceling this reservation I’m not able to offer compensation here under the airline policy."
-                )
+        # Step 3: eligibility check per policy
+        if not self._is_compensation_eligible(user_details, reservation):
+            membership = user_details.get("membership", "regular")
             return self._fallback_action(
-                "I’m not able to offer compensation here under the airline policy."
+                f"I’ve reviewed your account and reservation details. As a {membership} member without "
+                "travel insurance on an economy or basic economy ticket, I’m unable to offer compensation "
+                "per our airline policy. Compensation is available for Silver/Gold members, customers with "
+                "travel insurance, or Business class passengers."
             )
 
-        if membership == "regular":
-            return self._fallback_action(
-                "I verified your membership and reservation details. I’m not able to offer compensation here under the airline policy."
-            )
-
+        # Step 4: eligible — let LLM decide the appropriate action (send_certificate or respond)
         return None
+
+    def _has_any_flown_flight(self, reservation: dict[str, Any]) -> bool:
+        """Returns True if any flight in the reservation has already departed before BENCHMARK_NOW."""
+        flights = reservation.get("flights") or []
+        for flight in flights:
+            if not isinstance(flight, dict):
+                continue
+            # Check various date field names the tau2 schema might use
+            for field_name in ("actual_departure", "departure_datetime", "scheduled_departure", "date"):
+                departure = flight.get(field_name)
+                if departure and isinstance(departure, str):
+                    try:
+                        dep_dt = datetime.fromisoformat(departure)
+                        if dep_dt < BENCHMARK_NOW:
+                            return True
+                    except Exception:
+                        pass
+                    break
+        return False
 
     def _maybe_booking_reference_action(self, user_text: str) -> dict[str, Any] | None:
         lowered = user_text.lower()
@@ -1180,37 +1286,38 @@ class Agent:
     def _gate_tool_action(self, name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
         if name == "transfer_to_human_agents":
             latest_user = (self._latest_user_text() or "").lower()
-            if "human" not in latest_user and "supervisor" not in latest_user and "representative" not in latest_user:
+            user_requested = any(kw in latest_user for kw in ("human", "supervisor", "representative", "agent", "person"))
+            # Allow if user explicitly asked, or if we're past turn 3 (policy requires it for edge cases)
+            if not user_requested and self.turn_count <= 3:
                 return self._fallback_action(
-                    "I should try to handle this directly with the available tools before transferring you."
+                    "Let me try to assist you directly first. Could you tell me more about what you need?"
                 )
 
-        if name == "send_certificate" and not self.state.explicit_compensation_request:
-            return self._fallback_action(
-                "I can review the issue first, but I should not offer compensation unless you explicitly ask for it."
-            )
-
         if name == "send_certificate":
-            latest_user = (self._latest_user_text() or "").lower()
-            membership = (self.state.last_user_details or {}).get("membership")
-            if "cancel" not in latest_user and "change" not in latest_user and "modify" not in latest_user:
-                if membership == "regular":
-                    return self._fallback_action(
-                        "I verified your account and reservation details. You are a Regular member, not a Gold member, and because the reservation is not being changed or canceled I’m not able to issue compensation here under the airline policy."
-                    )
+            if not self.state.explicit_compensation_request:
                 return self._fallback_action(
-                    "I’m not able to issue compensation here because the reservation is not being changed or canceled."
+                    "I can review the issue first, but I should not offer compensation unless you explicitly ask for it."
                 )
             if self.state.last_reservation_details is None:
                 return self._fallback_action(
                     "I need verified reservation details before I can consider any compensation."
                 )
-            cabin = self.state.last_reservation_details.get("cabin")
-            insurance = self.state.last_reservation_details.get("insurance")
-            if membership == "regular" and insurance != "yes" and cabin != "business":
+            user_details = self.state.last_user_details or {}
+            reservation = self.state.last_reservation_details
+            if not self._is_compensation_eligible(user_details, reservation):
+                membership = user_details.get("membership", "regular")
                 return self._fallback_action(
-                    "I’m not able to issue compensation here under the airline policy."
+                    f"I’m unable to issue a compensation certificate. As a {membership} member without "
+                    "travel insurance on an economy or basic economy ticket, this is not covered by policy."
                 )
+            # For delayed flights: certificate only applies when also changing/cancelling
+            if self.state.known_delay_context:
+                recent_window = self._recent_user_text_window()
+                if not any(kw in recent_window for kw in ("cancel", "change", "modify")):
+                    return self._fallback_action(
+                        "For a delayed flight, a compensation certificate is only issued when changing or "
+                        "cancelling the reservation. Would you like to change or cancel your reservation?"
+                    )
 
         if name == "cancel_reservation":
             reservation_id = arguments.get("reservation_id") or self.state.known_reservation_id
@@ -1221,6 +1328,12 @@ class Agent:
                 return self._fallback_action(
                     "I need to verify the reservation details before proceeding with any cancellation action."
                 )
+            # Policy: if any flight already flown → transfer to human
+            if self._has_any_flown_flight(reservation):
+                return {
+                    "name": "transfer_to_human_agents",
+                    "arguments": {"summary": "Customer requesting cancellation but part of the itinerary has already been flown."},
+                }
             if reason is None:
                 return self._fallback_action(
                     "Before I can process a cancellation, I need the reason for the cancellation."
@@ -1267,6 +1380,26 @@ class Agent:
                 return self._fallback_action(
                     "I need verified reservation details before making any reservation changes."
                 )
+            reservation = self.state.last_reservation_details
+            cabin = reservation.get("cabin")
+            # Changing flights: not allowed for basic_economy
+            if name in ("update_reservation_flights",):
+                if cabin == "basic_economy":
+                    return self._fallback_action(
+                        "Basic economy flights cannot be changed. However, you can change to a different "
+                        "cabin class if you'd like. Is there anything else I can help you with?"
+                    )
+                if self._has_any_flown_flight(reservation):
+                    return self._fallback_action(
+                        "I'm unable to change the flights because part of this itinerary has already been flown."
+                    )
+            # Changing cabin: not allowed if any flight already flown
+            if name in ("update_reservation_cabin",):
+                if self._has_any_flown_flight(reservation):
+                    return self._fallback_action(
+                        "Cabin class cannot be changed because at least one flight in this reservation "
+                        "has already been flown."
+                    )
 
         if name == "book_reservation" and self.state.pending_intent == "book":
             if self.state.known_user_id is None and self.state.last_user_details is None:
@@ -1274,4 +1407,65 @@ class Agent:
                     "I need the user's verified profile before creating a reservation."
                 )
 
+        # Bag removal guard: can add but not remove checked bags
+        if name == "update_reservation_baggages":
+            reservation = self.state.last_reservation_details
+            if reservation is not None:
+                current_nonfree = reservation.get("nonfree_baggages", 0)
+                proposed = arguments.get("nonfree_baggages")
+                if proposed is not None:
+                    try:
+                        if int(proposed) < int(current_nonfree):
+                            return self._fallback_action(
+                                "I'm unable to remove checked bags from a reservation. You can only add additional bags."
+                            )
+                    except (TypeError, ValueError):
+                        pass
+
+        # Confirmation gate: all database-mutating actions require explicit user "yes"
+        _write_actions = {
+            "book_reservation",
+            "cancel_reservation",
+            "update_reservation_flights",
+            "update_reservation_cabin",
+            "update_reservation_baggages",
+            "update_reservation_passengers",
+        }
+        if name in _write_actions and not self._confirmation_bypass:
+            summary = self._build_write_summary(name, arguments)
+            self.state.pending_write_action = {"name": name, "arguments": arguments}
+            self.state.pending_write_summary = summary
+            return self._fallback_action(
+                f"{summary}\n\nShall I proceed? Please reply with 'yes' to confirm."
+            )
+
         return None
+
+    def _build_write_summary(self, name: str, arguments: dict[str, Any]) -> str:
+        """Build a human-readable summary of the write action for user confirmation."""
+        if name == "cancel_reservation":
+            rid = arguments.get("reservation_id") or self.state.known_reservation_id or "your reservation"
+            reason = arguments.get("reason") or self.state.known_cancellation_reason or "unspecified"
+            return f"I'm about to cancel reservation {rid} (reason: {reason})."
+        if name == "book_reservation":
+            origin = arguments.get("origin", "?")
+            dest = arguments.get("destination", "?")
+            cabin = arguments.get("cabin", "?")
+            passengers = arguments.get("passengers", [])
+            n = len(passengers) if isinstance(passengers, list) else "?"
+            return f"I'm about to book a {cabin} flight from {origin} to {dest} for {n} passenger(s)."
+        if name == "update_reservation_flights":
+            rid = arguments.get("reservation_id") or self.state.known_reservation_id or "your reservation"
+            return f"I'm about to update the flights on reservation {rid}."
+        if name == "update_reservation_cabin":
+            rid = arguments.get("reservation_id") or self.state.known_reservation_id or "your reservation"
+            cabin = arguments.get("cabin", "?")
+            return f"I'm about to change the cabin to {cabin} on reservation {rid}."
+        if name == "update_reservation_baggages":
+            rid = arguments.get("reservation_id") or self.state.known_reservation_id or "your reservation"
+            bags = arguments.get("nonfree_baggages", "?")
+            return f"I'm about to update checked bags to {bags} on reservation {rid}."
+        if name == "update_reservation_passengers":
+            rid = arguments.get("reservation_id") or self.state.known_reservation_id or "your reservation"
+            return f"I'm about to update passenger information on reservation {rid}."
+        return f"I'm about to perform: {name} with {json.dumps(arguments, ensure_ascii=False)}."
