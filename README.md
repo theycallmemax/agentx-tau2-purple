@@ -22,7 +22,10 @@ src/
 └─ server.py
 tests/
 ├─ conftest.py
-└─ test_agent.py
+├─ test_agent.py
+└─ test_examples.py
+scripts/
+└─ run_airline_eval.py
 Dockerfile
 run.sh
 ```
@@ -76,6 +79,59 @@ curl http://127.0.0.1:9019/.well-known/agent-card.json
 Сценарий `tau2` в tutorial использует этот wire format:
 - green-agent оркестрирует `tau2` benchmark;
 - purple-agent выдает по одному JSON action на ход.
+
+## Как проверять качество
+
+Есть два быстрых контура проверки.
+
+### 1. Regression tests на примерах
+
+Это unit-style сценарии без реального LLM и без живого benchmark server. Они проверяют:
+- что агент выбирает read action перед risky write action;
+- что агент чинит невалидный JSON retry-ом;
+- что агент не вызывает несуществующую tool;
+- что аргументы нормализуются перед отправкой.
+
+Часть prompt-regression проверок опирается на открытый `airline policy` из локальной копии `tau2-bench`, чтобы не потерять критичные правила вроде:
+- не предлагать компенсацию proactively;
+- верифицировать membership / insurance / flight status;
+- не просить reservation ids и airport codes, если это можно разрешить через инструменты и контекст.
+
+Запуск:
+
+```bash
+uv run pytest tests/test_examples.py -v
+```
+
+### 2. Локальный airline eval через green-agent
+
+Если у тебя уже запущен green-agent из `tau2-bench/src/experiments/agentify_tau_bench`, можно отправить benchmark request прямо из этого репозитория.
+
+Поднять purple-agent:
+
+```bash
+uv run src/server.py --host 127.0.0.1 --port 9009
+```
+
+Поднять green-agent в другом терминале:
+
+```bash
+cd /Users/maksimpiskaev/Проекты/agent_hw/tau2-bench/src/experiments/agentify_tau_bench
+uv run tau-bench-agent green
+```
+
+Запустить локальный eval запрос:
+
+```bash
+uv run python scripts/run_airline_eval.py --green-url http://127.0.0.1:9001 --white-url http://127.0.0.1:9009 --domain airline --task-ids 1 2 3
+```
+
+Если `--task-ids` не указывать, green-agent будет использовать все задачи домена.
+
+Практически полезный цикл такой:
+1. Гоняешь `tests/test_examples.py`, чтобы не сломать базовую логику.
+2. Гоняешь маленький airline eval на 3-10 задач.
+3. Разбираешь провальные траектории и улучшаешь policy/prompt/action gating.
 
 ## Docker
 
