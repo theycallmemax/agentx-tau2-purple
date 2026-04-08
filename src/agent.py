@@ -17,6 +17,8 @@ from a2a.utils import get_message_text, new_agent_text_message
 
 load_dotenv()
 
+# Drop unsupported params (e.g. temperature=0 is not supported by gpt-5 family)
+litellm.drop_params = True
 
 RESPOND_ACTION_NAME = "respond"
 MAX_CONTEXT_MESSAGES = int(os.getenv("TAU2_AGENT_MAX_CONTEXT_MESSAGES", "32"))
@@ -221,8 +223,27 @@ class Agent:
         # Bypass confirmation gate when re-executing an already-confirmed write action
         self._confirmation_bypass = False
 
+    def _normalize_input_prefix(self, input_text: str) -> str:
+        """Normalize raw JSON tool results to have 'tool:' prefix.
+
+        The tau2 benchmark sends tool results back as plain JSON without any prefix.
+        Without normalization, state update and routing code won't recognize them as
+        tool results and the agent loops calling get_user_details indefinitely.
+        """
+        stripped = input_text.strip()
+        if not stripped.startswith(("user:", "tool:")) and stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped)
+                if isinstance(payload, dict) and (
+                    "user_id" in payload or "reservation_id" in payload
+                ):
+                    return "tool: " + stripped
+            except Exception:
+                pass
+        return input_text
+
     async def run(self, message: Message, updater: TaskUpdater) -> None:
-        input_text = get_message_text(message)
+        input_text = self._normalize_input_prefix(get_message_text(message))
         self.turn_count += 1
 
         if self.allowed_action_names is None:
