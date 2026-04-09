@@ -70,8 +70,10 @@ CANCELLATION RULES:
 MODIFICATION RULES:
 - basic_economy cabin: flights CANNOT be changed. Cabin CAN be changed.
 - Cabin change: NOT allowed if any flight has already been flown.
+- Cabin change (upgrade or downgrade): use update_reservation_cabin directly with the reservation_id and new cabin name. Do NOT search for flights or check flight status first — just verify the reservation details and call update_reservation_cabin.
 - Bags: can add, cannot remove. Insurance: cannot add after booking.
 - Passengers: can modify details, cannot change count.
+- For update_reservation_cabin: arguments are {"reservation_id": "...", "cabin": "economy"/"business"/"basic_economy"}. No other arguments needed.
 """
 
 THINK_PROMPT = """Plan the next move carefully.
@@ -126,6 +128,8 @@ class SessionState:
     pending_write_summary: str | None = None
     # Transfer flow: must send "PLEASE HOLD ON" on the next turn
     just_transferred: bool = False
+    # Baggage allowance info already sent — don't repeat it, let LLM handle further requests
+    baggage_info_sent: bool = False
 
 
 USER_ID_PATTERN = re.compile(r"\b[a-z]+_[a-z]+_\d{3,}\b")
@@ -590,14 +594,19 @@ class Agent:
                 }
 
         if self.state.pending_intent == "baggage" and reservation is not None and user_details is not None:
-            total = self._compute_total_baggage_allowance(reservation, user_details)
-            if total is not None:
-                membership = user_details.get("membership", "your current")
-                return self._fallback_action(
-                    f"You can bring 4 suitcases total on this reservation. I verified that you are a {membership} member."
-                    if total == 4
-                    else f"You can bring {total} suitcases total on this reservation based on your verified membership and cabin."
-                )
+            # Only send the info reply once; skip if user wants to actually modify something
+            _action_words = ("add", "update", "change", "upgrade", "downgrade", "modify", "book")
+            _wants_action = any(w in lowered for w in _action_words)
+            if not self.state.baggage_info_sent and not _wants_action:
+                total = self._compute_total_baggage_allowance(reservation, user_details)
+                if total is not None:
+                    self.state.baggage_info_sent = True
+                    membership = user_details.get("membership", "your current")
+                    return self._fallback_action(
+                        f"You can bring 4 suitcases total on this reservation. I verified that you are a {membership} member."
+                        if total == 4
+                        else f"You can bring {total} suitcases total on this reservation based on your verified membership and cabin."
+                    )
 
         if self.state.pending_intent == "insurance" and reservation is not None:
             return self._fallback_action(
@@ -632,11 +641,15 @@ class Agent:
                     )
 
             if self.state.pending_intent == "baggage" and self.state.last_user_details is not None:
-                total = self._compute_total_baggage_allowance(tool_payload, self.state.last_user_details)
-                if total is not None:
-                    return self._fallback_action(
-                        f"You can bring {total} suitcases total on this reservation."
-                    )
+                _recent = (self._latest_user_text() or "").lower()
+                _action_words = ("add", "update", "change", "upgrade", "downgrade", "modify", "book")
+                if not self.state.baggage_info_sent and not any(w in _recent for w in _action_words):
+                    total = self._compute_total_baggage_allowance(tool_payload, self.state.last_user_details)
+                    if total is not None:
+                        self.state.baggage_info_sent = True
+                        return self._fallback_action(
+                            f"You can bring {total} suitcases total on this reservation."
+                        )
 
             if self.state.pending_intent == "compensation":
                 if self._reservation_matches_complaint(tool_payload):
