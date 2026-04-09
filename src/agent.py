@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -23,7 +24,9 @@ RESPOND_ACTION_NAME = "respond"
 MAX_CONTEXT_MESSAGES = int(os.getenv("TAU2_AGENT_MAX_CONTEXT_MESSAGES", "120"))
 TRANSFER_HOLD_MESSAGE = "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
 PLAN_MAX_TURNS = int(os.getenv("TAU2_AGENT_PLAN_MAX_TURNS", "2"))
-USER_ID_PATTERN = re.compile(r"\b[a-z]+_[a-z]+_\d{3,}\b")
+USER_ID_PATTERN = re.compile(
+    r"\b(?!credit_card_)(?!gift_card_)(?!certificate_)[a-z]+_[a-z]+_\d{3,}\b"
+)
 RESERVATION_ID_PATTERN = re.compile(r"\b(?=[A-Z0-9]{6}\b)(?=.*\d)[A-Z0-9]{6}\b")
 FLIGHT_NUMBER_PATTERN = re.compile(r"\bHAT\d{3}\b")
 AIRPORT_CODE_PATTERN = re.compile(r"\b[A-Z]{3}\b")
@@ -259,6 +262,7 @@ class Agent:
             "last_tool_user_text": None,
             "last_tool_streak": 0,
             "reservation_inventory": {},
+            "reservation_baseline_inventory": {},
             "flight_search_inventory": {},
             "membership": None,
             "pending_confirmation_action": None,
@@ -525,13 +529,28 @@ class Agent:
     ) -> str | None:
         if not isinstance(reservation_id, str) or not isinstance(target_cabin, str):
             return None
+        baseline_inventory = self.session_state.get("reservation_baseline_inventory", {})
         entry = self._current_reservation_entry(reservation_id)
+        baseline_entry = (
+            baseline_inventory.get(reservation_id)
+            if isinstance(baseline_inventory, dict)
+            else None
+        )
         search_inventory = self.session_state.get("flight_search_inventory", {})
-        if not isinstance(entry, dict) or not isinstance(search_inventory, dict):
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(baseline_entry, dict)
+            or not isinstance(search_inventory, dict)
+        ):
             return None
         flights = entry.get("flights")
+        baseline_flights = baseline_entry.get("flights")
         passenger_count = entry.get("passenger_count")
-        if not isinstance(flights, list) or not isinstance(passenger_count, int):
+        if (
+            not isinstance(flights, list)
+            or not isinstance(baseline_flights, list)
+            or not isinstance(passenger_count, int)
+        ):
             return None
 
         terms: list[str] = []
@@ -542,9 +561,20 @@ class Agent:
             destination = flight.get("destination")
             date = flight.get("date")
             flight_number = flight.get("flight_number")
-            current_price = flight.get("price")
             if not all(isinstance(value, str) and value for value in (origin, destination, date, flight_number)):
                 return None
+
+            baseline_match = next(
+                (
+                    candidate
+                    for candidate in baseline_flights
+                    if isinstance(candidate, dict)
+                    and candidate.get("flight_number") == flight_number
+                    and candidate.get("date") == date
+                ),
+                None,
+            )
+            current_price = baseline_match.get("price") if isinstance(baseline_match, dict) else None
             if not isinstance(current_price, (int, float)):
                 return None
 
@@ -575,6 +605,59 @@ class Agent:
         if passenger_count == 1:
             return joined
         return f"{passenger_count} * ({joined})"
+
+    def _next_missing_pricing_search(
+        self, reservation_id: str | None
+    ) -> dict[str, Any] | None:
+        entry = self._current_reservation_entry(reservation_id)
+        search_inventory = self.session_state.get("flight_search_inventory", {})
+        if not isinstance(entry, dict) or not isinstance(search_inventory, dict):
+            return None
+        flights = entry.get("flights")
+        if not isinstance(flights, list):
+            return None
+        for flight in flights:
+            if not isinstance(flight, dict):
+                continue
+            origin = flight.get("origin")
+            destination = flight.get("destination")
+            date = flight.get("date")
+            if not all(isinstance(value, str) and value for value in (origin, destination, date)):
+                continue
+            key = f"{origin}|{destination}|{date}"
+            if key in search_inventory:
+                continue
+            return {
+                "name": "search_direct_flight",
+                "arguments": {
+                    "origin": origin,
+                    "destination": destination,
+                    "date": date,
+                },
+            }
+        return None
+
+    def _reservation_has_flown_segments(self, reservation_id: str | None) -> bool | None:
+        entry = self._current_reservation_entry(reservation_id)
+        if not isinstance(entry, dict):
+            return None
+        flights = entry.get("flights")
+        if not isinstance(flights, list) or not flights:
+            return None
+        benchmark_date = BENCHMARK_NOW.date()
+        for flight in flights:
+            if not isinstance(flight, dict):
+                return None
+            date_text = flight.get("date")
+            if not isinstance(date_text, str):
+                return None
+            try:
+                flight_date = datetime.fromisoformat(date_text).date()
+            except ValueError:
+                return None
+            if flight_date < benchmark_date:
+                return True
+        return False
 
     def _same_flights_update_action(self, reservation_id: str, cabin: str) -> dict[str, Any] | None:
         entry = self._current_reservation_entry(reservation_id)
@@ -757,12 +840,33 @@ class Agent:
         elif not self._looks_like_affirmation(text) and (dates or len(airport_codes) >= 2):
             self.session_state["cabin_only_change"] = False
 
-        if self._looks_like_affirmation(text):
-            return
-
         lowered = text.lower()
         if "don't" in lowered or "do not" in lowered or "instead" in lowered:
             self.session_state["pending_confirmation_action"] = None
+        decline_upgrade = any(
+            phrase in lowered
+            for phrase in (
+                "can't proceed",
+                "cannot proceed",
+                "won't proceed",
+                "will not proceed",
+                "too expensive",
+                "over my budget",
+                "keep the current",
+                "keep my current",
+            )
+        ) or ("over $" in lowered)
+        baggage_only_followup = (
+            "add" in lowered and "bag" in lowered and "upgrade" not in lowered and "business" not in lowered
+        )
+        if decline_upgrade or baggage_only_followup:
+            self.session_state["requested_cabin"] = None
+            self.session_state["cabin_only_change"] = False
+            if self.session_state.get("pending_confirmation_action") == "update_reservation_flights":
+                self.session_state["pending_confirmation_action"] = None
+
+        if self._looks_like_affirmation(text):
+            return
 
     def _update_state_from_tool_payload(self, input_text: str) -> None:
         if not input_text.startswith("tool:"):
@@ -873,7 +977,7 @@ class Agent:
             inventory = self.session_state.get("reservation_inventory", {})
             if not isinstance(inventory, dict):
                 inventory = {}
-            inventory[reservation_id] = {
+            reservation_snapshot = {
                 "origin": origin,
                 "destination": destination,
                 "dates": self._dedupe_keep_order(
@@ -921,7 +1025,13 @@ class Agent:
                 "total_baggages": payload.get("total_baggages"),
                 "nonfree_baggages": payload.get("nonfree_baggages"),
             }
+            inventory[reservation_id] = reservation_snapshot
             self.session_state["reservation_inventory"] = inventory
+            baseline_inventory = self.session_state.get("reservation_baseline_inventory", {})
+            if not isinstance(baseline_inventory, dict):
+                baseline_inventory = {}
+            baseline_inventory.setdefault(reservation_id, copy.deepcopy(reservation_snapshot))
+            self.session_state["reservation_baseline_inventory"] = baseline_inventory
 
     def _remember_pending_confirmation(self, action: dict[str, Any]) -> None:
         if action.get("name") != RESPOND_ACTION_NAME:
@@ -1098,7 +1208,6 @@ class Agent:
                 "get_reservation_details",
                 "calculate",
                 "transfer_to_human_agents",
-                "get_flight_status",
             }
             if has_identity:
                 wanted |= {
@@ -1370,14 +1479,17 @@ class Agent:
             name == RESPOND_ACTION_NAME
             and isinstance(effective_reservation_id, str)
             and isinstance(requested_cabin, str)
-            and self.session_state.get("last_tool_name") != "calculate"
             and any(token in lowered_user_text for token in ("cost", "price", "pricing", "under $", "limit"))
         ):
-            expression = self._pricing_expression_for_current_reservation(
-                effective_reservation_id, requested_cabin
-            )
-            if expression:
-                return {"name": "calculate", "arguments": {"expression": expression}}
+            missing_search = self._next_missing_pricing_search(effective_reservation_id)
+            if missing_search is not None:
+                return missing_search
+            if self.session_state.get("last_tool_name") != "calculate":
+                expression = self._pricing_expression_for_current_reservation(
+                    effective_reservation_id, requested_cabin
+                )
+                if expression:
+                    return {"name": "calculate", "arguments": {"expression": expression}}
 
         if (
             name == RESPOND_ACTION_NAME
@@ -1442,6 +1554,28 @@ class Agent:
                 )
 
         if name == "get_flight_status":
+            if effective_task_type == "modify" and isinstance(effective_reservation_id, str):
+                has_flown_segments = self._reservation_has_flown_segments(
+                    effective_reservation_id
+                )
+                if has_flown_segments is False:
+                    missing_search = self._next_missing_pricing_search(
+                        effective_reservation_id
+                    )
+                    if missing_search is not None:
+                        return missing_search
+                    if isinstance(requested_cabin, str):
+                        expression = self._pricing_expression_for_current_reservation(
+                            effective_reservation_id, requested_cabin
+                        )
+                        if expression and self.session_state.get("last_tool_name") != "calculate":
+                            return {
+                                "name": "calculate",
+                                "arguments": {"expression": expression},
+                            }
+                    return self._fallback_action(
+                        "The reservation flights are all still upcoming, so I can continue without checking flight status."
+                    )
             proposed_flight_number = arguments.get("flight_number")
             if not flight_number_from_context or not self._looks_like_status_intent(
                 latest_user_text
@@ -1554,6 +1688,21 @@ class Agent:
                 return self._fallback_action(
                     "Please share your reservation number or user ID so I can look up the booking before changing it."
                 )
+            if (
+                isinstance(requested_cabin, str)
+                and any(
+                    token in lowered_user_text
+                    for token in ("cost", "price", "pricing", "under $", "budget", "before i confirm")
+                )
+            ):
+                missing_search = self._next_missing_pricing_search(effective_reservation_id)
+                if missing_search is not None:
+                    return missing_search
+                expression = self._pricing_expression_for_current_reservation(
+                    effective_reservation_id, requested_cabin
+                )
+                if expression:
+                    return {"name": "calculate", "arguments": {"expression": expression}}
 
         if name == "update_reservation_baggages":
             if (

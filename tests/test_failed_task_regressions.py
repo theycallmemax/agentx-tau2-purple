@@ -422,3 +422,118 @@ def test_upgrade_cost_request_forces_calculate_tool():
         "name": "calculate",
         "arguments": {"expression": "2 * ((350 - 122) + (499 - 127))"},
     }
+
+
+def test_affirmation_with_cost_constraint_prefers_pricing_over_write():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "business"
+    agent.session_state["cabin_only_change"] = True
+    agent.session_state["pending_confirmation_action"] = "update_reservation_flights"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Yes, please go ahead and check the cost for upgrading both passengers to business class. If it is over $650, then just upgrade Noah."',
+        }
+    )
+
+    action = agent._guard_action(
+        {"name": "respond", "arguments": {"content": "placeholder"}}
+    )
+
+    assert action == {
+        "name": "search_direct_flight",
+        "arguments": {
+            "origin": "BOS",
+            "destination": "MCO",
+            "date": "2024-05-18",
+        },
+    }
+
+
+def test_payment_id_is_not_misparsed_as_user_id():
+    agent = Agent()
+    agent.session_state["user_id"] = "chen_lee_6825"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Yes, please use credit_card_4938634 for the checked bags."',
+        }
+    )
+
+    action = agent._guard_action(
+        {"name": "get_user_details", "arguments": {"user_id": "credit_card_4938634"}}
+    )
+
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "user id or reservation number" in action["arguments"]["content"].lower()
+
+
+def test_modify_future_reservation_blocks_flight_status_tool():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "business"
+    agent.session_state["task_type"] = "modify"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Please verify the flights have not been flown yet before changing the cabin."',
+        }
+    )
+
+    action = agent._guard_action(
+        {
+            "name": "get_flight_status",
+            "arguments": {"flight_number": "HAT235", "date": "2024-05-18"},
+        }
+    )
+
+    assert action == {
+        "name": "search_direct_flight",
+        "arguments": {
+            "origin": "BOS",
+            "destination": "MCO",
+            "date": "2024-05-18",
+        },
+    }
+
+
+def test_pricing_expression_uses_baseline_reservation_prices():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"business","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":350},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":499}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498},{"payment_id":"credit_card_4938634","amount":1200}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["flight_search_inventory"] = {
+        "BOS|MCO|2024-05-18": [
+            {"flight_number": "HAT235", "prices": {"business": 350}},
+        ],
+        "MCO|MSP|2024-05-19": [
+            {"flight_number": "HAT298", "prices": {"business": 499}},
+        ],
+    }
+
+    assert agent._pricing_expression_for_current_reservation("YAX4DR", "business") == (
+        "2 * ((350 - 122) + (499 - 127))"
+    )
+
+
+def test_declining_expensive_upgrade_clears_pending_cabin_intent():
+    agent = Agent()
+    agent.session_state["requested_cabin"] = "business"
+    agent.session_state["cabin_only_change"] = True
+    agent.session_state["pending_confirmation_action"] = "update_reservation_flights"
+
+    agent._update_state_from_text(
+        "Since the additional cost is over $1000, I can't proceed with that upgrade. Just add the bags instead."
+    )
+
+    assert agent.session_state["requested_cabin"] is None
+    assert agent.session_state["cabin_only_change"] is False
+    assert agent.session_state["pending_confirmation_action"] is None
