@@ -11,6 +11,7 @@ from agent import (
     TRANSFER_HOLD_MESSAGE,
     _extract_json_object,
     _extract_openai_tools,
+    _normalize_respond_content,
 )
 
 
@@ -63,6 +64,19 @@ trailing text
         "name": "respond",
         "arguments": {"content": "hello"},
     }
+
+
+def test_extract_json_object_handles_stringified_json_payload():
+    payload = '"{\\"name\\":\\"respond\\",\\"arguments\\":{\\"content\\":\\"hello\\"}}"'
+    assert _extract_json_object(payload) == {
+        "name": "respond",
+        "arguments": {"content": "hello"},
+    }
+
+
+def test_normalize_respond_content_unwraps_nested_respond_json():
+    nested = '{"name":"respond","arguments":{"content":"Booked successfully."}}'
+    assert _normalize_respond_content(nested) == "Booked successfully."
 
 
 def test_normalize_action_rejects_unknown_tool():
@@ -153,10 +167,42 @@ def test_opening_turn_routes_compensation_with_flight_number_to_status():
     action = agent._guard_action(
         {"name": "respond", "arguments": {"content": "x"}}
     )
-    assert action == {
-        "name": "get_flight_status",
-        "arguments": {"flight_number": "HAT045", "date": "2024-05-15"},
-    }
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "flight date" in action["arguments"]["content"]
+
+
+def test_opening_turn_routes_baggage_question_to_lookup_request():
+    agent = Agent()
+    agent.turn_count = 1
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "How many suitcases am I allowed to take on my upcoming flight?"',
+        }
+    )
+    action = agent._guard_action(
+        {"name": "respond", "arguments": {"content": "x"}}
+    )
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "baggage allowance" in action["arguments"]["content"]
+
+
+def test_guard_action_blocks_get_flight_status_without_real_status_intent():
+    agent = Agent()
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "I would like to book a flight from SFO to New York."',
+        }
+    )
+    action = agent._guard_action(
+        {
+            "name": "get_flight_status",
+            "arguments": {"flight_number": "HAT001", "date": "2024-05-15"},
+        }
+    )
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "flight number" in action["arguments"]["content"]
 
 
 def test_call_llm_uses_tool_call_payload(monkeypatch):
@@ -187,6 +233,210 @@ def test_call_llm_uses_tool_call_payload(monkeypatch):
         "name": "get_user_details",
         "arguments": {"user_id": "abc"},
     }
+
+
+def test_call_llm_unwraps_nested_respond_json_content(monkeypatch):
+    agent = Agent()
+    completion = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    tool_calls=[],
+                    content='{"name":"respond","arguments":{"content":"{\\"name\\":\\"respond\\",\\"arguments\\":{\\"content\\":\\"hello\\"}}"}}',
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr("agent.litellm.completion", lambda **kwargs: completion)
+
+    assert agent._call_llm() == {
+        "name": "respond",
+        "arguments": {"content": "hello"},
+    }
+
+
+def test_update_state_from_tool_payload_extracts_reservations_and_payments():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"user_id":"mohamed_silva_9265","reservations":["K1NW8N"],"payment_methods":{"gift_card_1":{"id":"gift_card_1"},"certificate_2":{"id":"certificate_2"}}}'
+    )
+    assert agent.session_state["user_id"] == "mohamed_silva_9265"
+    assert agent.session_state["loaded_user_details"] is True
+    assert agent.session_state["known_reservation_ids"] == ["K1NW8N"]
+    assert agent.session_state["known_payment_ids"] == [
+        "gift_card_1",
+        "certificate_2",
+    ]
+
+
+def test_update_state_from_tool_payload_extracts_payment_balances():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"user_id":"mohamed_silva_9265","payment_methods":{"gift_card_1":{"id":"gift_card_1","amount":198},"certificate_2":{"id":"certificate_2","amount":250}}}'
+    )
+    assert agent.session_state["known_payment_balances"] == {
+        "gift_card_1": 198.0,
+        "certificate_2": 250.0,
+    }
+
+
+def test_opening_turn_balance_intent_routes_to_user_lookup():
+    agent = Agent()
+    agent.turn_count = 1
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "My user ID is mohamed_silva_9265. What are my gift card and certificate balances?"',
+        }
+    )
+    action = agent._guard_action(
+        {"name": "respond", "arguments": {"content": "x"}}
+    )
+    assert action == {
+        "name": "get_user_details",
+        "arguments": {"user_id": "mohamed_silva_9265"},
+    }
+
+
+def test_guard_action_responds_with_known_balances():
+    agent = Agent()
+    agent.session_state["loaded_user_details"] = True
+    agent.session_state["known_payment_balances"] = {
+        "gift_card_1": 198.0,
+        "certificate_2": 250.0,
+        "credit_card_9": 0.0,
+    }
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Can you tell me my gift card and certificate balances?"',
+        }
+    )
+    action = agent._guard_action(
+        {"name": "respond", "arguments": {"content": "x"}}
+    )
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "gift_card_1" in action["arguments"]["content"]
+    assert "certificate_2" in action["arguments"]["content"]
+
+
+def test_guard_action_blocks_flight_number_used_as_reservation_id():
+    agent = Agent()
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "I want flight HAT083."',
+        }
+    )
+    action = agent._guard_action(
+        {"name": "get_reservation_details", "arguments": {"reservation_id": "HAT083"}}
+    )
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "flight number" in action["arguments"]["content"]
+
+
+def test_inventory_can_infer_other_reservation_by_date():
+    agent = Agent()
+    agent.session_state["reservation_id"] = "D1EW9B"
+    agent.session_state["reservation_inventory"] = {
+        "D1EW9B": {
+            "origin": "ATL",
+            "destination": "JFK",
+            "dates": ["2024-05-17"],
+            "created_at": "2024-05-04T07:38:29",
+            "status": None,
+            "passenger_count": 1,
+        },
+        "9HBUV8": {
+            "origin": "DEN",
+            "destination": "BOS",
+            "dates": ["2024-05-17"],
+            "created_at": "2024-05-12T17:08:42",
+            "status": None,
+            "passenger_count": 1,
+        },
+    }
+    inferred = agent._infer_reservation_from_inventory(
+        "Please check the other flight I have on 2024-05-17."
+    )
+    assert inferred == "9HBUV8"
+
+
+def test_candidate_tool_names_narrows_cancel_flow_after_reservation_context():
+    agent = Agent()
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in (
+            "get_user_details",
+            "get_reservation_details",
+            "cancel_reservation",
+            "book_reservation",
+            "search_direct_flight",
+            "transfer_to_human_agents",
+        )
+    ]
+    agent.session_state["reservation_id"] = "K1NW8N"
+
+    narrowed = agent._candidate_tool_names("Please cancel my reservation K1NW8N.")
+
+    assert "cancel_reservation" in narrowed
+    assert "get_reservation_details" in narrowed
+    assert "book_reservation" not in narrowed
+
+
+def test_call_llm_uses_narrowed_tool_subset(monkeypatch):
+    agent = Agent()
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in (
+            "get_user_details",
+            "get_reservation_details",
+            "cancel_reservation",
+            "book_reservation",
+        )
+    ]
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Please cancel reservation K1NW8N."',
+        }
+    )
+    captured: dict[str, object] = {}
+
+    def fake_completion(**kwargs):
+        captured["tools"] = kwargs.get("tools")
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        tool_calls=[],
+                        content='{"name":"respond","arguments":{"content":"ok"}}',
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr("agent.litellm.completion", fake_completion)
+    agent._call_llm()
+
+    tool_names = [tool["function"]["name"] for tool in captured["tools"]]
+    assert "cancel_reservation" in tool_names
+    assert "get_reservation_details" in tool_names
+    assert "book_reservation" not in tool_names
 
 
 @pytest.mark.asyncio
