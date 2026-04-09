@@ -18,7 +18,7 @@ def main():
     parser.add_argument(
         "--agent-llm",
         type=str,
-        default=os.getenv("TAU2_AGENT_LLM", "openai/gpt-4.1"),
+        default=os.getenv("TAU2_AGENT_LLM", "openai/gpt-5.2"),
         help="LLM model to use through LiteLLM",
     )
     args = parser.parse_args()
