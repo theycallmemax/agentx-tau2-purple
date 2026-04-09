@@ -134,3 +134,291 @@ def test_task44_balance_intent_with_user_id_prefers_lookup_over_refusal():
         "name": "get_user_details",
         "arguments": {"user_id": "sophia_silva_7557"},
     }
+
+
+def test_current_run_modify_first_turn_requests_identity_before_search():
+    agent = Agent()
+    agent.turn_count = 1
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Hi! I need assistance with modifying my upcoming flight. I have a flight from IAH to SEA on May 23, and I would like to push it back to May 24. Also, I want to upgrade the class to business for all passengers. Can you help with that?"',
+        }
+    )
+
+    action = agent._guard_action(
+        {
+            "name": "search_direct_flight",
+            "arguments": {"origin": "IAH", "destination": "SEA", "date": "2026-05-24"},
+        }
+    )
+
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "reservation number or user id" in action["arguments"]["content"].lower()
+
+
+def test_current_run_remove_passenger_first_turn_requests_identity_before_search():
+    agent = Agent()
+    agent.turn_count = 1
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Hello! I need to remove a passenger named Sophia from my upcoming round trip flights from LAS to DEN, departing on May 19 and returning on May 20. Can you assist me with that?"',
+        }
+    )
+
+    action = agent._guard_action(
+        {
+            "name": "search_direct_flight",
+            "arguments": {"origin": "LAS", "destination": "DEN", "date": "2026-05-19"},
+        }
+    )
+
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "reservation number or user id" in action["arguments"]["content"].lower()
+
+
+def test_insurance_question_blocks_destructive_actions():
+    agent = Agent()
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Can you check whether insurance is added to reservation PEP4E0?"',
+        }
+    )
+
+    cancel_action = agent._guard_action(
+        {"name": "cancel_reservation", "arguments": {"reservation_id": "PEP4E0"}}
+    )
+    update_action = agent._guard_action(
+        {
+            "name": "update_reservation_flights",
+            "arguments": {
+                "reservation_id": "PEP4E0",
+                "cabin": "business",
+                "flights": [{"flight_number": "HAT001", "date": "2024-05-19"}],
+                "payment_id": "credit_card_1234567",
+            },
+        }
+    )
+
+    assert cancel_action["name"] == RESPOND_ACTION_NAME
+    assert update_action["name"] == RESPOND_ACTION_NAME
+
+
+def test_duplicate_reservation_lookup_is_blocked_for_same_turn():
+    agent = Agent()
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Please check reservation 3JA7XV."',
+        }
+    )
+    agent.session_state["last_tool_name"] = "get_reservation_details"
+    agent.session_state["last_tool_arguments"] = {"reservation_id": "3JA7XV"}
+    agent.session_state["last_tool_user_text"] = "Please check reservation 3JA7XV."
+    agent.session_state["last_tool_streak"] = 2
+
+    action = agent._guard_action(
+        {"name": "get_reservation_details", "arguments": {"reservation_id": "3JA7XV"}}
+    )
+
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "already checked" in action["arguments"]["content"].lower()
+
+
+def test_cancel_is_blocked_when_policy_makes_basic_economy_ineligible():
+    agent = Agent()
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'tool: {"reservation_id":"EHGLP3","user_id":"emma_kim_9957","origin":"PHX","destination":"JFK","flight_type":"one_way","cabin":"basic_economy","flights":[{"flight_number":"HAT156","origin":"PHX","destination":"SEA","date":"2024-05-17","price":50},{"flight_number":"HAT021","origin":"SEA","destination":"JFK","date":"2024-05-17","price":54}],"passengers":[{"first_name":"Evelyn","last_name":"Taylor","dob":"1965-01-16"},{"first_name":"Anya","last_name":"Silva","dob":"1971-11-22"}],"payment_history":[{"payment_id":"credit_card_5832574","amount":208}],"created_at":"2024-05-04T23:12:06","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}',
+        }
+    )
+    agent._update_state_from_tool_payload(agent.messages[-1]["content"])
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Yes, my user ID is emma_kim_9957. The reason for cancellation is a change of plans. Please go ahead and cancel the reservation."',
+        }
+    )
+    agent.session_state["pending_confirmation_action"] = "cancel_reservation"
+
+    action = agent._guard_action(
+        {"name": "cancel_reservation", "arguments": {"reservation_id": "EHGLP3"}}
+    )
+
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "not eligible for cancellation" in action["arguments"]["content"].lower()
+
+
+def test_cabin_only_change_confirmation_is_deterministic():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"GV1N64","user_id":"james_patel_9828","origin":"LAS","destination":"DEN","flight_type":"round_trip","cabin":"business","flights":[{"flight_number":"HAT003","origin":"LAS","destination":"DEN","date":"2024-05-19","price":561},{"flight_number":"HAT290","origin":"DEN","destination":"LAS","date":"2024-05-20","price":1339}],"payment_history":[{"payment_id":"gift_card_1642017","amount":5700}],"created_at":"2024-05-03T05:35:00","total_baggages":3,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Please downgrade reservation GV1N64 to basic economy and let me know the refund."',
+        }
+    )
+    agent._update_state_from_text(agent.messages[-1]["content"])
+
+    action = agent._guard_action(
+        {"name": "respond", "arguments": {"content": "placeholder"}}
+    )
+
+    assert action["name"] == RESPOND_ACTION_NAME
+    assert "change reservation gv1n64 from business to basic_economy" in action["arguments"]["content"].lower()
+
+
+def test_confirmed_cabin_only_change_uses_same_flights_update():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"GV1N64","user_id":"james_patel_9828","origin":"LAS","destination":"DEN","flight_type":"round_trip","cabin":"business","flights":[{"flight_number":"HAT003","origin":"LAS","destination":"DEN","date":"2024-05-19","price":561},{"flight_number":"HAT290","origin":"DEN","destination":"LAS","date":"2024-05-20","price":1339}],"payment_history":[{"payment_id":"gift_card_1642017","amount":5700}],"created_at":"2024-05-03T05:35:00","total_baggages":3,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "basic_economy"
+    agent.session_state["cabin_only_change"] = True
+    agent.session_state["pending_confirmation_action"] = "update_reservation_flights"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Yes, please proceed with the downgrade."',
+        }
+    )
+
+    action = agent._guard_action(
+        {"name": "respond", "arguments": {"content": "placeholder"}}
+    )
+
+    assert action == {
+        "name": "update_reservation_flights",
+        "arguments": {
+            "reservation_id": "GV1N64",
+            "cabin": "basic_economy",
+            "flights": [
+                {"flight_number": "HAT003", "date": "2024-05-19"},
+                {"flight_number": "HAT290", "date": "2024-05-20"},
+            ],
+            "payment_id": "gift_card_1642017",
+        },
+    }
+
+
+def test_cabin_only_modify_blocks_baggage_tool_misroute():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "business"
+    agent.session_state["cabin_only_change"] = True
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Yes, please upgrade the reservation to business."',
+        }
+    )
+
+    action = agent._guard_action(
+        {
+            "name": "update_reservation_baggages",
+            "arguments": {
+                "reservation_id": "YAX4DR",
+                "total_baggages": 2,
+                "nonfree_baggages": 0,
+                "payment_id": "credit_card_4938634",
+            },
+        }
+    )
+
+    assert action == {
+        "name": "update_reservation_flights",
+        "arguments": {
+            "reservation_id": "YAX4DR",
+            "cabin": "business",
+            "flights": [
+                {"flight_number": "HAT235", "date": "2024-05-18"},
+                {"flight_number": "HAT298", "date": "2024-05-19"},
+            ],
+            "payment_id": "credit_card_4938634",
+        },
+    }
+
+
+def test_baggage_update_is_normalized_to_free_allowance():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"user_id":"chen_lee_6825","membership":"gold","payment_methods":{"credit_card_4938634":{"id":"credit_card_4938634"}}}'
+    )
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Please add 2 checked bags to reservation YAX4DR."',
+        }
+    )
+
+    action = agent._guard_action(
+        {
+            "name": "update_reservation_baggages",
+            "arguments": {
+                "reservation_id": "YAX4DR",
+                "total_baggages": 2,
+                "nonfree_baggages": 2,
+                "payment_id": "credit_card_4938634",
+            },
+        }
+    )
+
+    assert action == {
+        "name": "update_reservation_baggages",
+        "arguments": {
+            "reservation_id": "YAX4DR",
+            "total_baggages": 2,
+            "nonfree_baggages": 0,
+            "payment_id": "credit_card_4938634",
+        },
+    }
+
+
+def test_upgrade_cost_request_forces_calculate_tool():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "business"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Please check the total price for upgrading both passengers to business. I only want it if it is under $650."',
+        }
+    )
+    agent.session_state["last_tool_name"] = "search_direct_flight"
+    agent.session_state["last_tool_arguments"] = {
+        "origin": "BOS",
+        "destination": "MCO",
+        "date": "2024-05-18",
+    }
+    agent._update_state_from_tool_payload(
+        'tool: [{"flight_number":"HAT235","origin":"BOS","destination":"MCO","prices":{"business":350}}]'
+    )
+    agent.session_state["last_tool_arguments"] = {
+        "origin": "MCO",
+        "destination": "MSP",
+        "date": "2024-05-19",
+    }
+    agent._update_state_from_tool_payload(
+        'tool: [{"flight_number":"HAT298","origin":"MCO","destination":"MSP","prices":{"business":499}}]'
+    )
+
+    action = agent._guard_action(
+        {"name": "respond", "arguments": {"content": "placeholder"}}
+    )
+
+    assert action == {
+        "name": "calculate",
+        "arguments": {"expression": "2 * ((350 - 122) + (499 - 127))"},
+    }
