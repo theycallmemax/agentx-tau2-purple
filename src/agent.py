@@ -74,6 +74,19 @@ MODIFICATION RULES:
 - Bags: can add, cannot remove. Insurance: cannot add after booking.
 - Passengers: can modify details, cannot change count.
 - For update_reservation_cabin: arguments are {"reservation_id": "...", "cabin": "economy"/"business"/"basic_economy"}. No other arguments needed.
+
+MULTI-INTENT HANDLING (flight change + cabin upgrade in same request):
+- Treat them as two SEPARATE sequential operations. Do NOT try to compute a combined fare difference.
+- Step 1: Handle the flight date/segment change — search ONLY for the legs being replaced (e.g., outbound legs if only the outbound date changes). Do NOT search return legs that remain unchanged.
+- Step 2: After the flight change is confirmed and executed, call update_reservation_cabin for the upgrade. No flight search is needed for this step.
+- CRITICAL: update_reservation_cabin does NOT require any flight pricing lookup. Never search_direct_flight or search_onestop_flight for return legs or for cabin upgrade fare calculation. The tool handles pricing automatically — just call it with reservation_id and cabin.
+- When user declines due to price ("too expensive", "over my budget", "I can't proceed"): do NOT re-search flights. Ask the user which change they want to proceed with, or explain that pricing is fixed.
+
+FLOWN FLIGHTS:
+- As soon as you retrieve reservation details and ANY flight date is before 2024-05-15, the itinerary is partially flown.
+- For cancellation requests: immediately call transfer_to_human_agents (do not re-check the reservation).
+- For cabin change requests: immediately refuse (cannot change cabin after flight).
+- Do NOT call get_reservation_details again after already retrieving it — the data does not change within a session.
 """
 
 THINK_PROMPT = """Plan the next move carefully.
@@ -349,7 +362,16 @@ class Agent:
     def _is_user_denial(self, text: str) -> bool:
         lowered = text.lower().strip()
         deny_tokens = ("no", "nope", "cancel", "stop", "don't", "do not", "abort", "never mind", "nevermind")
-        return any(lowered == t or lowered.startswith(t + " ") or lowered.startswith(t + ",") for t in deny_tokens)
+        if any(lowered == t or lowered.startswith(t + " ") or lowered.startswith(t + ",") for t in deny_tokens):
+            return True
+        # Recognize implicit denials: user declines due to cost or says they can't proceed
+        implicit_deny_phrases = (
+            "can't proceed", "cannot proceed", "i can't", "i cannot",
+            "too expensive", "over my budget", "too much", "can't afford",
+            "don't want to proceed", "do not want to proceed",
+            "won't proceed", "will not proceed",
+        )
+        return any(phrase in lowered for phrase in implicit_deny_phrases)
 
     def _generate_action(self, input_text: str, reasoning: str) -> dict[str, Any]:
         # Transfer two-step: policy requires sending HOLD message after transfer_to_human_agents
@@ -629,6 +651,15 @@ class Agent:
             self._mark_reservation_reviewed(tool_payload["reservation_id"])
             recent_user_text = self._latest_user_text()
             lowered = recent_user_text.lower() if recent_user_text else ""
+
+            # Policy: if any flight already flown and user wants cancellation → immediate transfer
+            if (self._looks_like_cancellation_request(lowered) or self.state.pending_intent == "cancel") and self._has_any_flown_flight(tool_payload):
+                rid = tool_payload.get("reservation_id", "the reservation")
+                return {
+                    "name": "transfer_to_human_agents",
+                    "arguments": {"summary": f"Customer requesting cancellation of {rid} but part of the itinerary has already been flown. Please assist with eligibility checks and refund processing."},
+                }
+
             if self._looks_like_cancellation_request(lowered) or self.state.pending_intent == "cancel":
                 reason = self._extract_cancellation_reason(lowered) or self.state.known_cancellation_reason
                 if reason is None:
@@ -854,6 +885,12 @@ class Agent:
             verified_facts.append("reservation_details=verified")
         if self.state.explicit_compensation_request:
             verified_facts.append("compensation=requested_by_user")
+        if self.state.pending_write_action is not None:
+            verified_facts.append(f"pending_write={self.state.pending_write_action.get('name','?')}")
+        if self.state.reviewed_reservation_ids:
+            verified_facts.append(f"reviewed_reservations={','.join(self.state.reviewed_reservation_ids)}")
+        if self.state.last_reservation_details is not None and self._has_any_flown_flight(self.state.last_reservation_details):
+            verified_facts.append("WARNING:some_flights_already_flown")
 
         if not verified_facts:
             verified_facts.append("none")
@@ -1318,6 +1355,26 @@ class Agent:
         return None
 
     def _gate_tool_action(self, name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+        if name in ("search_direct_flight", "search_onestop_flight"):
+            # Block return-leg searches in modify scenario: update_reservation_cabin needs no flight pricing
+            reservation = self.state.last_reservation_details
+            if reservation is not None and self.state.pending_intent == "modify":
+                search_origin = arguments.get("origin", "")
+                res_destination = reservation.get("destination", "")
+                res_origin = reservation.get("origin", "")
+                flight_type = reservation.get("flight_type", "")
+                # A search from the reservation's destination back toward origin = return leg
+                if (
+                    flight_type == "round_trip"
+                    and search_origin == res_destination
+                    and search_origin != res_origin
+                ):
+                    return self._fallback_action(
+                        "Return-leg flights are not changing. For a cabin upgrade, I will call "
+                        "update_reservation_cabin directly — no flight search needed. "
+                        "Let me confirm the full plan and get your approval before proceeding."
+                    )
+
         if name == "transfer_to_human_agents":
             latest_user = (self._latest_user_text() or "").lower()
             user_requested = any(kw in latest_user for kw in ("human", "supervisor", "representative", "agent", "person"))
@@ -1389,6 +1446,25 @@ class Agent:
 
         if name == "get_reservation_details":
             reservation_id = arguments.get("reservation_id")
+
+            # Block re-fetching a reservation we already have — prevents LLM loop
+            if (
+                reservation_id
+                and self.state.last_reservation_details is not None
+                and self.state.last_reservation_details.get("reservation_id") == reservation_id
+                and reservation_id in self.state.reviewed_reservation_ids
+            ):
+                cached = self.state.last_reservation_details
+                # If flown and cancellation context → transfer immediately
+                if (self.state.pending_intent == "cancel" or self._conversation_mentions_cancellation()) and self._has_any_flown_flight(cached):
+                    return {
+                        "name": "transfer_to_human_agents",
+                        "arguments": {"summary": f"Customer requesting cancellation of {reservation_id} but part of the itinerary has already been flown."},
+                    }
+                return self._fallback_action(
+                    "I already have the reservation details on file. Let me continue assisting you with your request."
+                )
+
             if isinstance(reservation_id, str) and self._extract_flight_number(reservation_id) == reservation_id:
                 if self.state.last_user_details is None and _is_valid_user_id(self.state.known_user_id):
                     return {
