@@ -127,7 +127,7 @@ def test_guard_action_blocks_hallucinated_user_id_not_present_in_context():
 
 def test_opening_turn_routes_reservation_number_to_lookup():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {"role": "user", "content": 'User message: "Cancel reservation EHGLP3."'}
     )
@@ -142,7 +142,7 @@ def test_opening_turn_routes_reservation_number_to_lookup():
 
 def test_opening_turn_routes_ambiguous_booking_to_airport_list():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {
             "role": "user",
@@ -157,7 +157,7 @@ def test_opening_turn_routes_ambiguous_booking_to_airport_list():
 
 def test_opening_turn_routes_compensation_with_flight_number_to_status():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {
             "role": "user",
@@ -173,7 +173,7 @@ def test_opening_turn_routes_compensation_with_flight_number_to_status():
 
 def test_opening_turn_routes_baggage_question_to_lookup_request():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {
             "role": "user",
@@ -282,7 +282,7 @@ def test_update_state_from_tool_payload_extracts_payment_balances():
 
 def test_opening_turn_balance_intent_routes_to_user_lookup():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {
             "role": "user",
@@ -362,7 +362,8 @@ def test_inventory_can_infer_other_reservation_by_date():
     assert inferred == "9HBUV8"
 
 
-def test_candidate_tool_names_narrows_cancel_flow_after_reservation_context():
+def test_active_tools_returns_all_tools():
+    """_active_tools should always return all tools, never filter by intent."""
     agent = Agent()
     agent.tools = [
         {
@@ -384,59 +385,12 @@ def test_candidate_tool_names_narrows_cancel_flow_after_reservation_context():
     ]
     agent.session_state["reservation_id"] = "K1NW8N"
 
-    narrowed = agent._candidate_tool_names("Please cancel my reservation K1NW8N.")
+    active = agent._active_tools()
 
-    assert "cancel_reservation" in narrowed
-    assert "get_reservation_details" in narrowed
-    assert "book_reservation" not in narrowed
-
-
-def test_call_llm_uses_narrowed_tool_subset(monkeypatch):
-    agent = Agent()
-    agent.tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": name,
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }
-        for name in (
-            "get_user_details",
-            "get_reservation_details",
-            "cancel_reservation",
-            "book_reservation",
-        )
-    ]
-    agent.messages.append(
-        {
-            "role": "user",
-            "content": 'User message: "Please cancel reservation K1NW8N."',
-        }
-    )
-    captured: dict[str, object] = {}
-
-    def fake_completion(**kwargs):
-        captured["tools"] = kwargs.get("tools")
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        tool_calls=[],
-                        content='{"name":"respond","arguments":{"content":"ok"}}',
-                    )
-                )
-            ]
-        )
-
-    monkeypatch.setattr("agent.litellm.completion", fake_completion)
-    agent._call_llm()
-
-    tool_names = [tool["function"]["name"] for tool in captured["tools"]]
+    tool_names = {t["function"]["name"] for t in active}
     assert "cancel_reservation" in tool_names
     assert "get_reservation_details" in tool_names
-    assert "book_reservation" not in tool_names
+    assert "book_reservation" in tool_names  # all tools always available
 
 
 @pytest.mark.asyncio
