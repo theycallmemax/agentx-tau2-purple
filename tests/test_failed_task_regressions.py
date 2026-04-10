@@ -80,7 +80,7 @@ def test_task22_can_reuse_reservation_inventory_for_other_flight_lookup():
 
 def test_task39_opening_turn_cancel_all_upcoming_starts_with_profile_lookup():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {
             "role": "user",
@@ -118,7 +118,7 @@ def test_task43_successful_mutation_adds_post_tool_summary_hint():
 
 def test_task44_balance_intent_with_user_id_prefers_lookup_over_refusal():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {
             "role": "user",
@@ -138,7 +138,7 @@ def test_task44_balance_intent_with_user_id_prefers_lookup_over_refusal():
 
 def test_current_run_modify_first_turn_requests_identity_before_search():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {
             "role": "user",
@@ -159,7 +159,7 @@ def test_current_run_modify_first_turn_requests_identity_before_search():
 
 def test_current_run_remove_passenger_first_turn_requests_identity_before_search():
     agent = Agent()
-    agent.turn_count = 1
+    agent.turn_count = 2
     agent.messages.append(
         {
             "role": "user",
@@ -269,8 +269,14 @@ def test_cabin_only_change_confirmation_is_deterministic():
         {"name": "respond", "arguments": {"content": "placeholder"}}
     )
 
-    assert action["name"] == RESPOND_ACTION_NAME
-    assert "change reservation gv1n64 from business to basic_economy" in action["arguments"]["content"].lower()
+    assert action == {
+        "name": "search_direct_flight",
+        "arguments": {
+            "origin": "LAS",
+            "destination": "DEN",
+            "date": "2024-05-19",
+        },
+    }
 
 
 def test_confirmed_cabin_only_change_uses_same_flights_update():
@@ -537,3 +543,145 @@ def test_declining_expensive_upgrade_clears_pending_cabin_intent():
     assert agent.session_state["requested_cabin"] is None
     assert agent.session_state["cabin_only_change"] is False
     assert agent.session_state["pending_confirmation_action"] is None
+
+
+def test_cost_question_blocks_flight_update_and_forces_pricing():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "business"
+    agent.session_state["pending_confirmation_action"] = "update_reservation_flights"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Before I confirm, could you tell me the total extra cost? I need to keep it under $1000."',
+        }
+    )
+
+    action = agent._guard_action(
+        {
+            "name": "update_reservation_flights",
+            "arguments": {
+                "reservation_id": "YAX4DR",
+                "cabin": "business",
+                "flights": [
+                    {"flight_number": "HAT235", "date": "2024-05-18"},
+                    {"flight_number": "HAT298", "date": "2024-05-19"},
+                ],
+                "payment_id": "credit_card_4938634",
+            },
+        }
+    )
+
+    assert action == {
+        "name": "search_direct_flight",
+        "arguments": {
+            "origin": "BOS",
+            "destination": "MCO",
+            "date": "2024-05-18",
+        },
+    }
+
+
+def test_cabin_only_confirmation_requires_price_quote_before_write():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "business"
+    agent.session_state["cabin_only_change"] = True
+    agent.session_state["pending_confirmation_action"] = "update_reservation_flights"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Yes, please upgrade the cabin to business for all passengers."',
+        }
+    )
+
+    action = agent._guard_action(
+        {
+            "name": "update_reservation_flights",
+            "arguments": {
+                "reservation_id": "YAX4DR",
+                "cabin": "business",
+                "flights": [
+                    {"flight_number": "HAT235", "date": "2024-05-18"},
+                    {"flight_number": "HAT298", "date": "2024-05-19"},
+                ],
+                "payment_id": "credit_card_4938634",
+            },
+        }
+    )
+
+    assert action == {
+        "name": "search_direct_flight",
+        "arguments": {
+            "origin": "BOS",
+            "destination": "MCO",
+            "date": "2024-05-18",
+        },
+    }
+
+
+def test_modify_search_is_restricted_to_existing_segments():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "business"
+    agent.session_state["task_type"] = "modify"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Could you check if business seats are available from Boston to Minneapolis for reservation YAX4DR?"',
+        }
+    )
+
+    action = agent._guard_action(
+        {
+            "name": "search_direct_flight",
+            "arguments": {
+                "origin": "BOS",
+                "destination": "MSP",
+                "date": "2024-05-18",
+            },
+        }
+    )
+
+    assert action == {
+        "name": "search_direct_flight",
+        "arguments": {
+            "origin": "BOS",
+            "destination": "MCO",
+            "date": "2024-05-18",
+        },
+    }
+
+
+def test_loaded_reservation_reroutes_repeat_lookup_to_pricing_flow():
+    agent = Agent()
+    agent._update_state_from_tool_payload(
+        'tool: {"reservation_id":"YAX4DR","user_id":"chen_lee_6825","origin":"BOS","destination":"MSP","flight_type":"one_way","cabin":"economy","flights":[{"flight_number":"HAT235","origin":"BOS","destination":"MCO","date":"2024-05-18","price":122},{"flight_number":"HAT298","origin":"MCO","destination":"MSP","date":"2024-05-19","price":127}],"passengers":[{"first_name":"Chen","last_name":"Lee","dob":"1967-12-12"},{"first_name":"Noah","last_name":"Hernandez","dob":"1968-01-06"}],"payment_history":[{"payment_id":"credit_card_4938634","amount":498}],"created_at":"2024-05-05T23:00:15","total_baggages":0,"nonfree_baggages":0,"insurance":"no","status":null}'
+    )
+    agent.session_state["requested_cabin"] = "business"
+    agent.session_state["task_type"] = "modify"
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "Can you check whether business seats are available for reservation YAX4DR?"',
+        }
+    )
+
+    action = agent._guard_action(
+        {"name": "get_reservation_details", "arguments": {"reservation_id": "YAX4DR"}}
+    )
+
+    assert action == {
+        "name": "search_direct_flight",
+        "arguments": {
+            "origin": "BOS",
+            "destination": "MCO",
+            "date": "2024-05-18",
+        },
+    }
