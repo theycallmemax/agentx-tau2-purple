@@ -8,3 +8,5 @@ dist/
 wheels/
 *.egg-info
 .venv
+analysis
+scripts
