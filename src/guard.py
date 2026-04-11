@@ -696,6 +696,36 @@ def guard_action(
             f"I already completed the cancellation for reservation {effective_reservation_id}. I should summarize it or continue to the next explicit subtask."
         )
 
+    # When task is cancel, reservation is already loaded, and user provides a cancellation
+    # reason, check eligibility immediately before letting the LLM decide.
+    if (
+        effective_task_type == "cancel"
+        and isinstance(effective_reservation_id, str)
+        and state.get("loaded_reservation_details")
+        and not looks_like_affirmation(latest_user_text)
+        and name == RESPOND_ACTION_NAME
+    ):
+        cancel_reason_by_reservation = state.get("cancel_reason_by_reservation", {})
+        cancel_reason_text = (
+            cancel_reason_by_reservation.get(effective_reservation_id)
+            if isinstance(cancel_reason_by_reservation, dict)
+            else None
+        ) or state.get("cancel_reason")
+        eligibility_context = (
+            cancel_reason_text
+            if isinstance(cancel_reason_text, str) and cancel_reason_text
+            else latest_user_text
+        )
+        is_eligible, refusal = cancel_eligibility(
+            state, effective_reservation_id, eligibility_context
+        )
+        state["cancel_eligible"] = is_eligible
+        if not is_eligible:
+            return fallback_action(
+                refusal
+                or "This reservation is not eligible for cancellation under the airline policy."
+            )
+
     if (
         looks_like_affirmation(latest_user_text)
         and (
