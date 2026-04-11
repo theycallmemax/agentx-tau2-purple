@@ -1,37 +1,133 @@
+"""Tau2 benchmark agent — orchestrator that delegates to specialized modules."""
+
 from __future__ import annotations
 
-import copy
 import json
 import os
 import re
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, TypedDict
 
 import litellm
 from dotenv import load_dotenv
+from langgraph.graph import END, START, StateGraph
 
 from a2a.server.tasks import TaskUpdater
 from a2a.types import DataPart, Message, Part, TaskState
 from a2a.utils import get_message_text, new_agent_text_message
 
+try:
+    from .extractors import (
+        extract_airport_codes,
+        extract_dates,
+        extract_entities_from_history,
+        extract_flight_number,
+        extract_reservation_id,
+    )
+    from .intent import looks_like_all_reservations_intent
+    from .guard import guard_action
+    from .parsing import (
+        RESPOND_ACTION_NAME,
+        extract_json_object,
+        extract_openai_tools,
+        normalize_respond_content,
+    )
+    from .planner import (
+        parse_plan,
+        plan_prompt,
+        planner_conflicts_with_state,
+        should_plan,
+    )
+    from .playbooks import build_policy_reminder, build_prompt_blocks
+    from .policy_sanitizer import sanitize_tool_descriptions
+    from .reservation import (
+        cancel_eligibility,
+        BENCHMARK_NOW,
+        current_reservation_entry,
+        find_reservation_by_flight_number,
+        find_reservation_by_route,
+        infer_reservation_from_inventory,
+        pricing_expression_for_current_reservation,
+        reservation_has_flown_segments,
+    )
+    from .runtime import (
+        build_runtime_brief,
+        compressed_history_summary,
+        history_snapshot,
+        record_completed_action,
+        resolve_completed_subtasks,
+        sync_runtime_state,
+        termination_controller,
+    )
+    from .session_state import (
+        build_state_summary,
+        clear_pending_confirmation_if_completed,
+        create_initial_state,
+        remember_pending_confirmation,
+        update_state_from_text,
+        update_state_from_tool_payload,
+    )
+except ImportError:  # pragma: no cover - direct src imports in tests
+    from extractors import (
+        extract_airport_codes,
+        extract_dates,
+        extract_entities_from_history,
+        extract_flight_number,
+        extract_reservation_id,
+    )
+    from intent import looks_like_all_reservations_intent
+    from guard import guard_action
+    from parsing import (
+        RESPOND_ACTION_NAME,
+        extract_json_object,
+        extract_openai_tools,
+        normalize_respond_content,
+    )
+    from planner import (
+        parse_plan,
+        plan_prompt,
+        planner_conflicts_with_state,
+        should_plan,
+    )
+    from playbooks import build_policy_reminder, build_prompt_blocks
+    from policy_sanitizer import sanitize_tool_descriptions
+    from reservation import (
+        cancel_eligibility,
+        BENCHMARK_NOW,
+        current_reservation_entry,
+        find_reservation_by_flight_number,
+        find_reservation_by_route,
+        infer_reservation_from_inventory,
+        pricing_expression_for_current_reservation,
+        reservation_has_flown_segments,
+    )
+    from runtime import (
+        build_runtime_brief,
+        compressed_history_summary,
+        history_snapshot,
+        record_completed_action,
+        resolve_completed_subtasks,
+        sync_runtime_state,
+        termination_controller,
+    )
+    from session_state import (
+        build_state_summary,
+        clear_pending_confirmation_if_completed,
+        create_initial_state,
+        remember_pending_confirmation,
+        update_state_from_text,
+        update_state_from_tool_payload,
+    )
 
 load_dotenv()
 
 # Drop unsupported params (e.g. temperature=0 is not supported by gpt-5 family)
 litellm.drop_params = True
 
-RESPOND_ACTION_NAME = "respond"
 MAX_CONTEXT_MESSAGES = int(os.getenv("TAU2_AGENT_MAX_CONTEXT_MESSAGES", "120"))
+PLAN_MAX_TURNS = int(os.getenv("TAU2_AGENT_PLAN_MAX_TURNS", "8"))
 TRANSFER_HOLD_MESSAGE = "YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON."
-PLAN_MAX_TURNS = int(os.getenv("TAU2_AGENT_PLAN_MAX_TURNS", "2"))
-USER_ID_PATTERN = re.compile(
-    r"\b(?!credit_card_)(?!gift_card_)(?!certificate_)[a-z]+_[a-z]+_\d{3,}\b"
-)
-RESERVATION_ID_PATTERN = re.compile(r"\b(?=[A-Z0-9]{6}\b)(?=.*\d)[A-Z0-9]{6}\b")
-FLIGHT_NUMBER_PATTERN = re.compile(r"\bHAT\d{3}\b")
-AIRPORT_CODE_PATTERN = re.compile(r"\b[A-Z]{3}\b")
-DATE_PATTERN = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
-BENCHMARK_NOW = datetime.fromisoformat("2024-05-15T15:00:00")
 
 SYSTEM_PROMPT = """You are a customer service agent participating in the tau2 benchmark.
 
@@ -61,177 +157,16 @@ Hard rules:
 
 Return raw JSON only, no prose, no code fences."""
 
-
-def _strip_code_fences(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text).strip()
-        text = re.sub(r"```$", "", text).strip()
-    return text
+_extract_json_object = extract_json_object
+_extract_openai_tools = extract_openai_tools
+_normalize_respond_content = normalize_respond_content
 
 
-def _extract_balanced_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-            continue
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-
-    return None
-
-
-def _extract_json_object(text: str) -> dict[str, Any] | None:
-    cleaned = _strip_code_fences(text)
-    tag_match = re.search(
-        r"<json>\s*(.*?)\s*</json>", cleaned, flags=re.DOTALL | re.IGNORECASE
-    )
-    if tag_match:
-        cleaned = tag_match.group(1).strip()
-
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, str):
-            return _extract_json_object(data)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        pass
-
-    balanced = _extract_balanced_json_object(cleaned)
-    if not balanced:
-        return None
-
-    try:
-        data = json.loads(balanced)
-        if isinstance(data, str):
-            return _extract_json_object(data)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _normalize_respond_content(content: Any) -> str:
-    if not isinstance(content, str):
-        return ""
-
-    normalized = content.strip()
-    seen: set[str] = set()
-    while normalized and normalized not in seen:
-        seen.add(normalized)
-        parsed = _extract_json_object(normalized)
-        if not isinstance(parsed, dict):
-            break
-        if parsed.get("name") != RESPOND_ACTION_NAME:
-            break
-        arguments = parsed.get("arguments")
-        nested = arguments.get("content") if isinstance(arguments, dict) else None
-        if not isinstance(nested, str):
-            break
-        normalized = nested.strip()
-    return normalized
-
-
-def _iter_balanced_json_arrays(text: str):
-    """Yield every top-level JSON array substring found in text."""
-    i = 0
-    length = len(text)
-    while i < length:
-        if text[i] != "[":
-            i += 1
-            continue
-        start = i
-        depth = 0
-        in_string = False
-        escape = False
-        j = start
-        while j < length:
-            c = text[j]
-            if in_string:
-                if escape:
-                    escape = False
-                elif c == "\\":
-                    escape = True
-                elif c == '"':
-                    in_string = False
-            else:
-                if c == '"':
-                    in_string = True
-                elif c == "[":
-                    depth += 1
-                elif c == "]":
-                    depth -= 1
-                    if depth == 0:
-                        yield text[start : j + 1]
-                        break
-            j += 1
-        i = j + 1 if j < length else length
-
-
-def _normalize_openai_tool(entry: dict[str, Any]) -> dict[str, Any] | None:
-    """Coerce a dict into the OpenAI {"type":"function","function":{...}} shape."""
-    if not isinstance(entry, dict):
-        return None
-    if entry.get("type") == "function" and isinstance(entry.get("function"), dict):
-        fn = entry["function"]
-        if isinstance(fn.get("name"), str):
-            return entry
-        return None
-    if isinstance(entry.get("name"), str) and isinstance(
-        entry.get("parameters"), dict
-    ):
-        return {
-            "type": "function",
-            "function": {
-                "name": entry["name"],
-                "description": entry.get("description", ""),
-                "parameters": entry["parameters"],
-            },
-        }
-    return None
-
-
-def _extract_openai_tools(text: str) -> list[dict[str, Any]] | None:
-    """Find an OpenAI-style tools array embedded in the first evaluator message."""
-    best: list[dict[str, Any]] = []
-    for candidate in _iter_balanced_json_arrays(text):
-        try:
-            data = json.loads(candidate)
-        except Exception:
-            continue
-        if not isinstance(data, list) or len(data) < 2:
-            continue
-        normalized: list[dict[str, Any]] = []
-        for item in data:
-            tool = _normalize_openai_tool(item)
-            if tool is None:
-                normalized = []
-                break
-            normalized.append(tool)
-        if normalized and len(normalized) > len(best):
-            best = normalized
-    return best or None
+class TurnGraphState(TypedDict, total=False):
+    input_text: str
+    latest_user_text: str
+    action: dict[str, Any]
+    should_return: bool
 
 
 class Agent:
@@ -245,32 +180,22 @@ class Agent:
         self.tool_names: set[str] = set()
         self.turn_count = 0
         self.just_transferred = False
-        self.session_state: dict[str, Any] = {
-            "user_id": None,
-            "reservation_id": None,
-            "flight_number": None,
-            "origin": None,
-            "destination": None,
-            "travel_dates": [],
-            "known_reservation_ids": [],
-            "known_payment_ids": [],
-            "known_payment_balances": {},
-            "loaded_user_details": False,
-            "loaded_reservation_details": False,
-            "last_tool_name": None,
-            "last_tool_arguments": None,
-            "last_tool_user_text": None,
-            "last_tool_streak": 0,
-            "reservation_inventory": {},
-            "reservation_baseline_inventory": {},
-            "flight_search_inventory": {},
-            "membership": None,
-            "pending_confirmation_action": None,
-            "requested_cabin": None,
-            "cabin_only_change": False,
-            "cabin_price_quoted": False,
-            "task_type": "general",
-        }
+        self.session_state: dict[str, Any] = create_initial_state()
+        self.latest_plan: dict[str, Any] | None = None
+        self.debug_logging_enabled = (
+            os.getenv("TAU2_AGENT_DEBUG_LOGGING", "1").strip().lower() not in {"0", "false", "no"}
+        )
+        self.debug_log_path = Path(
+            os.getenv(
+                "TAU2_AGENT_DEBUG_LOG_PATH",
+                str(Path(__file__).resolve().parents[1] / "analysis" / "debug" / "agent_trace.jsonl"),
+            )
+        )
+        self._turn_graph = self._build_turn_graph()
+
+    # ------------------------------------------------------------------
+    # Input helpers
+    # ------------------------------------------------------------------
 
     def _normalize_input_prefix(self, input_text: str) -> str:
         """Raw JSON tool results arrive without a prefix; tag them as tool output."""
@@ -284,63 +209,13 @@ class Agent:
                 pass
         return input_text
 
-    def _messages_for_model(self) -> list[dict[str, Any]]:
-        state_summary = self._state_summary_message()
-        extra_system: list[dict[str, str]] = []
-        if self.turn_count >= 6 and self.turn_count % 4 == 0:
-            extra_system.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Policy reminder: avoid redundant reads, do not confuse flight numbers "
-                        "with reservation IDs, reuse known profile data, and summarize completed "
-                        "actions instead of restarting the conversation."
-                    ),
-                }
-            )
-        if self._should_hint_post_tool_summary():
-            extra_system.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "The previous tool call succeeded. Your next action should normally be "
-                        "a concise user-facing summary of the completed change, unless the tool "
-                        "result clearly requires another immediate lookup."
-                    ),
-                }
-            )
-        if len(self.messages) <= MAX_CONTEXT_MESSAGES:
-            msgs = list(self.messages)
-            msgs.insert(1, state_summary)
-            return msgs + extra_system
-        # Preserve system + first evaluator message (policy + tool schemas), keep recent tail.
-        preserved = self.messages[:2]
-        recent = self.messages[-(MAX_CONTEXT_MESSAGES - 3) :]
-        return (
-            preserved[:1]
-            + [state_summary]
-            + preserved[1:]
-            + [
-                {
-                    "role": "user",
-                    "content": (
-                        "[Earlier conversation messages omitted. Continue from the "
-                        "latest verified state and keep following the original policy.]"
-                    ),
-                }
-            ]
-            + extra_system
-            + recent
-        )
-
-    def _fallback_action(self, content: str) -> dict[str, Any]:
-        return {"name": RESPOND_ACTION_NAME, "arguments": {"content": content}}
-
     def _latest_user_text(self) -> str:
         for message in reversed(self.messages):
             if message.get("role") == "user":
                 content = message.get("content")
                 if isinstance(content, str):
+                    if content.startswith("tool:"):
+                        continue
                     marker = "User message:"
                     if marker in content:
                         embedded = content.rsplit(marker, 1)[1].strip()
@@ -359,744 +234,146 @@ class Agent:
                     return content
         return ""
 
-    def _extract_user_id(self, text: str) -> str | None:
-        match = USER_ID_PATTERN.search(text)
-        return match.group(0) if match else None
+    # ------------------------------------------------------------------
+    # Message preparation
+    # ------------------------------------------------------------------
 
-    def _extract_reservation_id(self, text: str) -> str | None:
-        match = RESERVATION_ID_PATTERN.search(text)
-        return match.group(0) if match else None
+    def _messages_for_model(self) -> list[dict[str, Any]]:
+        sync_runtime_state(self.session_state, self._latest_user_text())
+        state_summary = build_state_summary(self.session_state)
+        extra_system: list[dict[str, str]] = []
+        verified_entities = extract_entities_from_history(self.messages)
+        verified_user_ids = sorted(verified_entities["user_ids"])
+        verified_reservation_ids = sorted(verified_entities["reservation_ids"])
+        verified_flight_numbers = sorted(verified_entities["flight_numbers"])
 
-    def _extract_flight_number(self, text: str) -> str | None:
-        match = FLIGHT_NUMBER_PATTERN.search(text)
-        return match.group(0) if match else None
-
-    def _extract_dates(self, text: str) -> list[str]:
-        return DATE_PATTERN.findall(text)
-
-    def _extract_requested_cabin(self, text: str) -> str | None:
-        lowered = text.lower()
-        if "basic economy" in lowered:
-            return "basic_economy"
-        if "business" in lowered:
-            return "business"
-        if "economy" in lowered:
-            return "economy"
-        return None
-
-    def _dedupe_keep_order(self, values: list[str]) -> list[str]:
-        seen: set[str] = set()
-        result: list[str] = []
-        for value in values:
-            if value and value not in seen:
-                seen.add(value)
-                result.append(value)
-        return result
-
-    def _looks_like_modify_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in (
-                "change my flight",
-                "modify my flight",
-                "change reservation",
-                "modify reservation",
-                "switch to",
-                "push it back",
-                "move it to",
-                "upgrade",
-                "upgrade the class",
-                "downgrade",
-                "downgrade the class",
-                "downgrade the cabin",
-                "upgrade cabin",
-                "change the cabin",
-                "change the class",
-                "nonstop flight",
-                "direct flight",
-                "cheapest economy",
-            )
-        )
-
-    def _looks_like_remove_passenger_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return (
-            "remove passenger" in lowered
-            or "remove a passenger" in lowered
-            or "remove just" in lowered
-            or ("remove" in lowered and "passenger" in lowered)
-        )
-
-    def _looks_like_insurance_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return "insurance" in lowered and not self._looks_like_compensation_intent(text)
-
-    def _looks_like_cancel_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return "cancel" in lowered or "cancellation" in lowered
-
-    def _looks_like_affirmation(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in (
-                "yes",
-                "go ahead",
-                "please proceed",
-                "proceed with",
-                "do it",
-                "confirm",
-            )
-        )
-
-    def _task_type(self, text: str) -> str:
-        if self._looks_like_balance_intent(text):
-            return "balance"
-        if self._looks_like_remove_passenger_intent(text):
-            return "remove_passenger"
-        if self._looks_like_baggage_intent(text):
-            return "baggage"
-        if self._looks_like_insurance_intent(text):
-            return "insurance"
-        if self._looks_like_cancel_intent(text):
-            return "cancel"
-        if self._looks_like_booking_intent(text):
-            return "booking"
-        if self._looks_like_modify_intent(text):
-            return "modify"
-        if self._looks_like_status_intent(text) or self._looks_like_compensation_intent(text):
-            return "status"
-        return "general"
-
-    def _extract_cancel_reason(self, text: str) -> str | None:
-        lowered = text.lower()
-        if "change of plan" in lowered or "change of plans" in lowered:
-            return "change_of_plan"
-        if "airline cancelled" in lowered or "airline canceled" in lowered:
-            return "airline_cancelled"
-        if "cancelled flight" in lowered or "canceled flight" in lowered:
-            return "airline_cancelled"
-        if "sick" in lowered or "ill" in lowered or "medical" in lowered:
-            return "health"
-        if "weather" in lowered or "storm" in lowered:
-            return "weather"
-        if "other" in lowered:
-            return "other"
-        return None
-
-    def _current_reservation_entry(self, reservation_id: str | None = None) -> dict[str, Any] | None:
-        candidate = reservation_id or self.session_state.get("reservation_id")
-        inventory = self.session_state.get("reservation_inventory", {})
-        if not isinstance(candidate, str) or not isinstance(inventory, dict):
-            return None
-        entry = inventory.get(candidate)
-        return entry if isinstance(entry, dict) else None
-
-    def _reservation_payment_id(self, reservation_id: str | None = None) -> str | None:
-        entry = self._current_reservation_entry(reservation_id)
-        if not isinstance(entry, dict):
-            return None
-        payment_id = entry.get("payment_id")
-        return payment_id if isinstance(payment_id, str) and payment_id else None
-
-    def _current_membership(self) -> str | None:
-        membership = self.session_state.get("membership")
-        return membership if isinstance(membership, str) and membership else None
-
-    def _free_bags_per_passenger(self, membership: str | None, cabin: str | None) -> int:
-        table = {
-            "regular": {"basic_economy": 0, "economy": 1, "business": 2},
-            "silver": {"basic_economy": 1, "economy": 2, "business": 3},
-            "gold": {"basic_economy": 2, "economy": 3, "business": 4},
-        }
-        if not isinstance(membership, str) or not isinstance(cabin, str):
-            return 0
-        return table.get(membership, {}).get(cabin, 0)
-
-    def _normalized_nonfree_baggages(
-        self, reservation_id: str | None, total_baggages: int
-    ) -> int | None:
-        entry = self._current_reservation_entry(reservation_id)
-        membership = self._current_membership()
-        if not isinstance(entry, dict) or not isinstance(membership, str):
-            return None
-        passenger_count = entry.get("passenger_count")
-        cabin = entry.get("cabin")
-        if not isinstance(passenger_count, int) or not isinstance(cabin, str):
-            return None
-        allowance = self._free_bags_per_passenger(membership, cabin) * passenger_count
-        return max(0, total_baggages - allowance)
-
-    def _pricing_expression_for_current_reservation(
-        self, reservation_id: str | None, target_cabin: str | None
-    ) -> str | None:
-        if not isinstance(reservation_id, str) or not isinstance(target_cabin, str):
-            return None
-        baseline_inventory = self.session_state.get("reservation_baseline_inventory", {})
-        entry = self._current_reservation_entry(reservation_id)
-        baseline_entry = (
-            baseline_inventory.get(reservation_id)
-            if isinstance(baseline_inventory, dict)
-            else None
-        )
-        search_inventory = self.session_state.get("flight_search_inventory", {})
-        if (
-            not isinstance(entry, dict)
-            or not isinstance(baseline_entry, dict)
-            or not isinstance(search_inventory, dict)
-        ):
-            return None
-        flights = entry.get("flights")
-        baseline_flights = baseline_entry.get("flights")
-        passenger_count = entry.get("passenger_count")
-        if (
-            not isinstance(flights, list)
-            or not isinstance(baseline_flights, list)
-            or not isinstance(passenger_count, int)
-        ):
-            return None
-
-        terms: list[str] = []
-        for flight in flights:
-            if not isinstance(flight, dict):
-                return None
-            origin = flight.get("origin")
-            destination = flight.get("destination")
-            date = flight.get("date")
-            flight_number = flight.get("flight_number")
-            if not all(isinstance(value, str) and value for value in (origin, destination, date, flight_number)):
-                return None
-
-            baseline_match = next(
-                (
-                    candidate
-                    for candidate in baseline_flights
-                    if isinstance(candidate, dict)
-                    and candidate.get("flight_number") == flight_number
-                    and candidate.get("date") == date
-                ),
-                None,
-            )
-            current_price = baseline_match.get("price") if isinstance(baseline_match, dict) else None
-            if not isinstance(current_price, (int, float)):
-                return None
-
-            options = search_inventory.get(f"{origin}|{destination}|{date}")
-            if not isinstance(options, list):
-                return None
-            match = next(
-                (
-                    option
-                    for option in options
-                    if isinstance(option, dict) and option.get("flight_number") == flight_number
-                ),
-                None,
-            )
-            if not isinstance(match, dict):
-                return None
-            prices = match.get("prices")
-            if not isinstance(prices, dict):
-                return None
-            new_price = prices.get(target_cabin)
-            if not isinstance(new_price, (int, float)):
-                return None
-            terms.append(f"({int(new_price)} - {int(current_price)})")
-
-        if not terms:
-            return None
-        joined = " + ".join(terms)
-        if passenger_count == 1:
-            return joined
-        return f"{passenger_count} * ({joined})"
-
-    def _next_missing_pricing_search(
-        self, reservation_id: str | None
-    ) -> dict[str, Any] | None:
-        entry = self._current_reservation_entry(reservation_id)
-        search_inventory = self.session_state.get("flight_search_inventory", {})
-        if not isinstance(entry, dict) or not isinstance(search_inventory, dict):
-            return None
-        flights = entry.get("flights")
-        if not isinstance(flights, list):
-            return None
-        for flight in flights:
-            if not isinstance(flight, dict):
-                continue
-            origin = flight.get("origin")
-            destination = flight.get("destination")
-            date = flight.get("date")
-            if not all(isinstance(value, str) and value for value in (origin, destination, date)):
-                continue
-            key = f"{origin}|{destination}|{date}"
-            if key in search_inventory:
-                continue
-            return {
-                "name": "search_direct_flight",
-                "arguments": {
-                    "origin": origin,
-                    "destination": destination,
-                    "date": date,
-                },
-            }
-        return None
-
-    def _matches_reservation_segment(
-        self,
-        reservation_id: str | None,
-        origin: str | None,
-        destination: str | None,
-        date: str | None,
-    ) -> bool:
-        entry = self._current_reservation_entry(reservation_id)
-        if not isinstance(entry, dict):
-            return False
-        flights = entry.get("flights")
-        if not isinstance(flights, list):
-            return False
-        for flight in flights:
-            if not isinstance(flight, dict):
-                continue
-            if (
-                flight.get("origin") == origin
-                and flight.get("destination") == destination
-                and flight.get("date") == date
-            ):
-                return True
-        return False
-
-    def _reservation_has_flown_segments(self, reservation_id: str | None) -> bool | None:
-        entry = self._current_reservation_entry(reservation_id)
-        if not isinstance(entry, dict):
-            return None
-        flights = entry.get("flights")
-        if not isinstance(flights, list) or not flights:
-            return None
-        benchmark_date = BENCHMARK_NOW.date()
-        for flight in flights:
-            if not isinstance(flight, dict):
-                return None
-            date_text = flight.get("date")
-            if not isinstance(date_text, str):
-                return None
-            try:
-                flight_date = datetime.fromisoformat(date_text).date()
-            except ValueError:
-                return None
-            if flight_date < benchmark_date:
-                return True
-        return False
-
-    def _same_flights_update_action(self, reservation_id: str, cabin: str) -> dict[str, Any] | None:
-        entry = self._current_reservation_entry(reservation_id)
-        if not isinstance(entry, dict):
-            return None
-        flights = entry.get("flights")
-        payment_id = self._reservation_payment_id(reservation_id)
-        if not isinstance(flights, list) or not flights or not payment_id:
-            return None
-        normalized_flights = []
-        for flight in flights:
-            if not isinstance(flight, dict):
-                continue
-            flight_number = flight.get("flight_number")
-            date = flight.get("date")
-            if isinstance(flight_number, str) and isinstance(date, str):
-                normalized_flights.append({"flight_number": flight_number, "date": date})
-        if not normalized_flights:
-            return None
-        return {
-            "name": "update_reservation_flights",
-            "arguments": {
-                "reservation_id": reservation_id,
-                "cabin": cabin,
-                "flights": normalized_flights,
-                "payment_id": payment_id,
-            },
-        }
-
-    def _cabin_change_confirmation(self, reservation_id: str, cabin: str) -> dict[str, Any] | None:
-        entry = self._current_reservation_entry(reservation_id)
-        if not isinstance(entry, dict):
-            return None
-        current_cabin = entry.get("cabin")
-        flights = entry.get("flights") or []
-        payment_id = self._reservation_payment_id(reservation_id)
-        if not payment_id or not isinstance(current_cabin, str):
-            return None
-        lines = []
-        for flight in flights:
-            if not isinstance(flight, dict):
-                continue
-            flight_number = flight.get("flight_number")
-            date = flight.get("date")
-            if isinstance(flight_number, str) and isinstance(date, str):
-                lines.append(f"- {flight_number} on {date}")
-        if not lines:
-            return None
-        return self._fallback_action(
-            f"I can change reservation {reservation_id} from {current_cabin} to {cabin} for the same flights:\n"
-            + "\n".join(lines)
-            + f"\n\nI would use the original payment method on file ({payment_id}) for any fare difference or refund.\n\n"
-            + 'Reply "yes" to confirm I should apply this cabin change.'
-        )
-
-    def _cancel_eligibility(self, reservation_id: str | None, latest_user_text: str) -> tuple[bool, str | None]:
-        entry = self._current_reservation_entry(reservation_id)
-        if not entry:
-            return False, "Please share your reservation number so I can verify whether the booking can be cancelled."
-
-        status = entry.get("status")
-        if isinstance(status, str) and status.lower() == "cancelled":
-            return False, "That reservation is already cancelled."
-
-        created_at = entry.get("created_at")
-        booked_within_24h = False
-        if isinstance(created_at, str):
-            try:
-                created_dt = datetime.fromisoformat(created_at)
-                booked_within_24h = (BENCHMARK_NOW - created_dt).total_seconds() <= 24 * 3600
-            except ValueError:
-                booked_within_24h = False
-
-        cabin = entry.get("cabin")
-        is_business = isinstance(cabin, str) and cabin == "business"
-        has_insurance = entry.get("insurance") == "yes"
-        cancel_reason = self._extract_cancel_reason(latest_user_text)
-        covered_reason = cancel_reason in {"health", "weather"}
-        airline_cancelled = cancel_reason == "airline_cancelled"
-
-        if booked_within_24h or airline_cancelled or is_business or (has_insurance and covered_reason):
-            return True, None
-
-        if not cancel_reason:
-            return (
-                False,
-                "Please share the reason for cancellation so I can verify whether this reservation is eligible to be cancelled.",
-            )
-
-        return (
-            False,
-            "This reservation is not eligible for cancellation under the airline policy because it was not booked within 24 hours, the flight was not cancelled by the airline, the cabin is not business, and the stated reason is not covered by insurance.",
-        )
-
-    def _state_summary_message(self) -> dict[str, str]:
-        inventory = self.session_state.get("reservation_inventory", {})
-        inventory_summary = []
-        if isinstance(inventory, dict):
-            for reservation_id, entry in list(inventory.items())[:6]:
-                if not isinstance(entry, dict):
-                    continue
-                inventory_summary.append(
-                    {
-                        "reservation_id": reservation_id,
-                        "origin": entry.get("origin"),
-                        "destination": entry.get("destination"),
-                        "dates": entry.get("dates", [])[:4],
-                        "created_at": entry.get("created_at"),
-                        "status": entry.get("status"),
-                        "passenger_count": entry.get("passenger_count"),
-                    }
+        if verified_user_ids or verified_reservation_ids or verified_flight_numbers:
+            constraint_lines = [
+                "Verified entities from the user conversation override any example values in tool descriptions."
+            ]
+            if verified_user_ids:
+                constraint_lines.append(
+                    "Known user_id values: "
+                    + ", ".join(verified_user_ids)
+                    + ". Use only these when calling get_user_details."
                 )
-        summary = {
-            "user_id": self.session_state.get("user_id"),
-            "reservation_id": self.session_state.get("reservation_id"),
-            "flight_number": self.session_state.get("flight_number"),
-            "origin": self.session_state.get("origin"),
-            "destination": self.session_state.get("destination"),
-            "travel_dates": self.session_state.get("travel_dates", [])[:4],
-            "known_reservation_ids": self.session_state.get("known_reservation_ids", [])[
-                :6
-            ],
-            "known_payment_ids": self.session_state.get("known_payment_ids", [])[:8],
-            "loaded_user_details": self.session_state.get("loaded_user_details"),
-            "loaded_reservation_details": self.session_state.get(
-                "loaded_reservation_details"
-            ),
-            "last_tool_name": self.session_state.get("last_tool_name"),
-            "last_tool_arguments": self.session_state.get("last_tool_arguments"),
-            "known_payment_balances": self.session_state.get("known_payment_balances", {}),
-            "reservation_inventory": inventory_summary,
-            "pending_confirmation_action": self.session_state.get(
-                "pending_confirmation_action"
-            ),
-            "task_type": self.session_state.get("task_type"),
-        }
-        return {
-            "role": "system",
-            "content": (
-                "Structured session state for reuse across steps: "
-                + json.dumps(summary, ensure_ascii=False)
-            ),
-        }
-
-    def _merge_state_lists(self, key: str, values: list[str]) -> None:
-        existing = self.session_state.get(key, [])
-        if not isinstance(existing, list):
-            existing = []
-        self.session_state[key] = self._dedupe_keep_order(existing + values)
-
-    def _update_state_from_text(self, text: str) -> None:
-        latest_task_type = self._task_type(text)
-        if latest_task_type != "general":
-            self.session_state["task_type"] = latest_task_type
-        requested_cabin = self._extract_requested_cabin(text)
-        if requested_cabin and requested_cabin != self.session_state.get("requested_cabin"):
-            self.session_state["cabin_price_quoted"] = False
-        if requested_cabin:
-            self.session_state["requested_cabin"] = requested_cabin
-
-        user_id = self._extract_user_id(text)
-        reservation_id = self._extract_reservation_id(text)
-        flight_number = self._extract_flight_number(text)
-        dates = self._extract_dates(text)
-        airport_codes = AIRPORT_CODE_PATTERN.findall(text)
-
-        if user_id:
-            self.session_state["user_id"] = user_id
-        if reservation_id:
-            self.session_state["reservation_id"] = reservation_id
-            self._merge_state_lists("known_reservation_ids", [reservation_id])
-        if flight_number:
-            self.session_state["flight_number"] = flight_number
-        if dates:
-            self._merge_state_lists("travel_dates", dates)
-        if len(airport_codes) >= 2:
-            self.session_state["origin"] = airport_codes[0]
-            self.session_state["destination"] = airport_codes[1]
-
-        if requested_cabin and not dates and len(airport_codes) < 2:
-            self.session_state["cabin_only_change"] = True
-        elif not self._looks_like_affirmation(text) and (dates or len(airport_codes) >= 2):
-            self.session_state["cabin_only_change"] = False
-
-        lowered = text.lower()
-        if "don't" in lowered or "do not" in lowered or "instead" in lowered:
-            self.session_state["pending_confirmation_action"] = None
-        decline_upgrade = any(
-            phrase in lowered
-            for phrase in (
-                "can't proceed",
-                "cannot proceed",
-                "won't proceed",
-                "will not proceed",
-                "too expensive",
-                "over my budget",
-                "keep the current",
-                "keep my current",
+            if verified_reservation_ids:
+                constraint_lines.append(
+                    "Known reservation_id values: "
+                    + ", ".join(verified_reservation_ids)
+                    + ". Do not replace them with flight numbers."
+                )
+            if verified_flight_numbers:
+                constraint_lines.append(
+                    "Known flight_number values: "
+                    + ", ".join(verified_flight_numbers)
+                    + ". Flight numbers are not reservation IDs."
+                )
+            extra_system.append(
+                {"role": "system", "content": "\n".join(constraint_lines)}
             )
-        ) or ("over $" in lowered)
-        baggage_only_followup = (
-            "add" in lowered and "bag" in lowered and "upgrade" not in lowered and "business" not in lowered
+        if self.turn_count >= 4 and self.turn_count % 3 == 0:
+            extra_system.append(
+                {
+                    "role": "system",
+                    "content": build_policy_reminder(self.session_state),
+                }
+            )
+        elif (self.session_state.get("active_flow") or {}).get("name") not in {None, "general"}:
+            extra_system.append(
+                {
+                    "role": "system",
+                    "content": build_policy_reminder(self.session_state),
+                }
+            )
+        extra_system.extend(
+            {"role": "system", "content": block}
+            for block in build_prompt_blocks(self.session_state)
         )
-        if decline_upgrade or baggage_only_followup:
-            self.session_state["requested_cabin"] = None
-            self.session_state["cabin_only_change"] = False
-            self.session_state["cabin_price_quoted"] = False
-            if self.session_state.get("pending_confirmation_action") == "update_reservation_flights":
-                self.session_state["pending_confirmation_action"] = None
-
-        if self._looks_like_affirmation(text):
-            return
-
-    def _update_state_from_tool_payload(self, input_text: str) -> None:
-        if not input_text.startswith("tool:"):
-            return
-        payload_text = input_text.split("tool:", 1)[1].strip()
-        try:
-            payload = json.loads(payload_text)
-        except Exception:
-            return
-        if (
-            isinstance(payload, (int, float))
-            and self.session_state.get("last_tool_name") == "calculate"
-            and isinstance(self.session_state.get("requested_cabin"), str)
-        ):
-            self.session_state["cabin_price_quoted"] = True
-            return
-        if isinstance(payload, list):
-            last_tool_name = self.session_state.get("last_tool_name")
-            last_tool_arguments = self.session_state.get("last_tool_arguments")
-            if last_tool_name not in {"search_direct_flight", "search_onestop_flight"}:
-                return
-            if not isinstance(last_tool_arguments, dict):
-                return
-            origin = last_tool_arguments.get("origin")
-            destination = last_tool_arguments.get("destination")
-            date = last_tool_arguments.get("date")
-            if not all(isinstance(value, str) and value for value in (origin, destination, date)):
-                return
-            if not all(isinstance(item, dict) for item in payload):
-                return
-            inventory = self.session_state.get("flight_search_inventory", {})
-            if not isinstance(inventory, dict):
-                inventory = {}
-            inventory[f"{origin}|{destination}|{date}"] = payload
-            self.session_state["flight_search_inventory"] = inventory
-            return
-        if not isinstance(payload, dict):
-            return
-
-        user_id = payload.get("user_id")
-        reservation_id = payload.get("reservation_id")
-        flight_number = payload.get("flight_number")
-        origin = payload.get("origin")
-        destination = payload.get("destination")
-        membership = payload.get("membership")
-
-        if isinstance(user_id, str) and user_id:
-            self.session_state["user_id"] = user_id
-            self.session_state["loaded_user_details"] = True
-        if isinstance(membership, str) and membership:
-            self.session_state["membership"] = membership
-        if isinstance(reservation_id, str) and reservation_id:
-            self.session_state["reservation_id"] = reservation_id
-            self.session_state["loaded_reservation_details"] = True
-            self._merge_state_lists("known_reservation_ids", [reservation_id])
-        if isinstance(flight_number, str) and flight_number:
-            self.session_state["flight_number"] = flight_number
-        if isinstance(origin, str) and origin:
-            self.session_state["origin"] = origin
-        if isinstance(destination, str) and destination:
-            self.session_state["destination"] = destination
-
-        reservations = payload.get("reservations")
-        if isinstance(reservations, list):
-            self._merge_state_lists(
-                "known_reservation_ids",
-                [value for value in reservations if isinstance(value, str)],
-            )
-
-        payment_methods = payload.get("payment_methods")
-        if isinstance(payment_methods, dict):
-            self._merge_state_lists(
-                "known_payment_ids",
-                [key for key in payment_methods if isinstance(key, str)],
-            )
-            balances = {}
-            for key, method in payment_methods.items():
-                if not isinstance(key, str) or not isinstance(method, dict):
-                    continue
-                amount = method.get("amount")
-                if isinstance(amount, (int, float)):
-                    balances[key] = float(amount)
-            if balances:
-                existing = self.session_state.get("known_payment_balances", {})
-                if not isinstance(existing, dict):
-                    existing = {}
-                existing.update(balances)
-                self.session_state["known_payment_balances"] = existing
-
-        payment_history = payload.get("payment_history")
-        if isinstance(payment_history, list):
-            self._merge_state_lists(
-                "known_payment_ids",
-                [
-                    item.get("payment_id")
-                    for item in payment_history
-                    if isinstance(item, dict) and isinstance(item.get("payment_id"), str)
-                ],
-            )
-
-        flights = payload.get("flights")
-        if isinstance(flights, list):
-            dates: list[str] = []
-            for flight in flights:
-                if not isinstance(flight, dict):
-                    continue
-                if isinstance(flight.get("flight_number"), str):
-                    self.session_state["flight_number"] = flight["flight_number"]
-                if isinstance(flight.get("date"), str):
-                    dates.append(flight["date"])
-            if dates:
-                self._merge_state_lists("travel_dates", dates)
-
-        if isinstance(reservation_id, str) and reservation_id:
-            inventory = self.session_state.get("reservation_inventory", {})
-            if not isinstance(inventory, dict):
-                inventory = {}
-            reservation_snapshot = {
-                "origin": origin,
-                "destination": destination,
-                "dates": self._dedupe_keep_order(
-                    [
-                        flight.get("date")
-                        for flight in flights or []
-                        if isinstance(flight, dict) and isinstance(flight.get("date"), str)
-                    ]
-                ),
-                "flight_numbers": self._dedupe_keep_order(
-                    [
-                        flight.get("flight_number")
-                        for flight in flights or []
-                        if isinstance(flight, dict)
-                        and isinstance(flight.get("flight_number"), str)
-                    ]
-                ),
-                "flights": [
-                    {
-                        "flight_number": flight.get("flight_number"),
-                        "origin": flight.get("origin"),
-                        "destination": flight.get("destination"),
-                        "date": flight.get("date"),
-                        "price": flight.get("price"),
-                    }
-                    for flight in flights or []
-                    if isinstance(flight, dict)
-                    and isinstance(flight.get("flight_number"), str)
-                    and isinstance(flight.get("date"), str)
-                ],
-                "created_at": payload.get("created_at"),
-                "status": payload.get("status"),
-                "cabin": payload.get("cabin"),
-                "payment_id": (
-                    payment_history[0].get("payment_id")
-                    if isinstance(payment_history, list)
-                    and payment_history
-                    and isinstance(payment_history[0], dict)
-                    and isinstance(payment_history[0].get("payment_id"), str)
-                    else None
-                ),
-                "passenger_count": len(payload.get("passengers", []))
-                if isinstance(payload.get("passengers"), list)
-                else None,
-                "total_baggages": payload.get("total_baggages"),
-                "nonfree_baggages": payload.get("nonfree_baggages"),
+        extra_system.append(
+            {
+                "role": "system",
+                "content": "Compact runtime brief: " + history_snapshot(self.session_state),
             }
-            inventory[reservation_id] = reservation_snapshot
-            self.session_state["reservation_inventory"] = inventory
-            baseline_inventory = self.session_state.get("reservation_baseline_inventory", {})
-            if not isinstance(baseline_inventory, dict):
-                baseline_inventory = {}
-            baseline_inventory.setdefault(reservation_id, copy.deepcopy(reservation_snapshot))
-            self.session_state["reservation_baseline_inventory"] = baseline_inventory
-
-    def _remember_pending_confirmation(self, action: dict[str, Any]) -> None:
-        if action.get("name") != RESPOND_ACTION_NAME:
-            return
-        content = str(action.get("arguments", {}).get("content", "")).lower()
-        if not content:
-            return
-        if "reply" not in content and "confirm" not in content and "proceed" not in content:
-            return
-        if "cancel" in content:
-            self.session_state["pending_confirmation_action"] = "cancel_reservation"
-            return
-        if "bag" in content:
-            self.session_state["pending_confirmation_action"] = "update_reservation_baggages"
-            return
-        if any(word in content for word in ("upgrade", "change", "modify", "cabin")):
-            self.session_state["pending_confirmation_action"] = "update_reservation_flights"
-
-    def _clear_pending_confirmation_if_completed(self, action: dict[str, Any]) -> None:
-        if action.get("name") in {
-            "cancel_reservation",
-            "update_reservation_flights",
-            "update_reservation_baggages",
-        }:
-            self.session_state["pending_confirmation_action"] = None
-        if action.get("name") == "update_reservation_flights":
-            self.session_state["cabin_price_quoted"] = False
+        )
+        extra_system.append(
+            {
+                "role": "system",
+                "content": (
+                    "Verified facts only before execute pass: "
+                    + json.dumps(self.session_state.get("verified_facts_cache", {}), ensure_ascii=False)
+                ),
+            }
+        )
+        extra_system.append(
+            {
+                "role": "system",
+                "content": (
+                    "Open questions still unresolved: "
+                    + json.dumps(
+                        [
+                            label
+                            for label, value in (
+                                ("awaiting_choice_between_options", self.session_state.get("awaiting_choice_between_options")),
+                                ("awaiting_flight_selection", self.session_state.get("awaiting_flight_selection")),
+                                ("awaiting_payment_choice", self.session_state.get("awaiting_payment_choice")),
+                                ("pending_confirmation_action", self.session_state.get("pending_confirmation_action")),
+                                ("last_tool_error", self.session_state.get("last_tool_error")),
+                            )
+                            if value
+                        ],
+                        ensure_ascii=False,
+                    )
+                ),
+            }
+        )
+        extra_system.append(
+            {
+                "role": "system",
+                "content": (
+                    "What has already been done: "
+                    + json.dumps(self.session_state.get("completed_actions", [])[-8:], ensure_ascii=False)
+                ),
+            }
+        )
+        if self._should_hint_post_tool_summary():
+            extra_system.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "The previous tool call succeeded. Your next action should normally be "
+                        "a concise user-facing summary of the completed change, unless the tool "
+                        "result clearly requires another immediate lookup."
+                    ),
+                }
+            )
+        if len(self.messages) <= MAX_CONTEXT_MESSAGES:
+            msgs = list(self.messages)
+            msgs.insert(1, state_summary)
+            return msgs + extra_system
+        # Preserve system + first evaluator message (policy + tool schemas), keep recent tail.
+        preserved = self.messages[:2]
+        recent = self.messages[-(MAX_CONTEXT_MESSAGES - 3) :]
+        self.session_state["history_compression_summary"] = compressed_history_summary(
+            self.messages, self.session_state
+        )
+        return (
+            preserved[:1]
+            + [state_summary]
+            + preserved[1:]
+            + [
+                {
+                    "role": "user",
+                    "content": (
+                        "[Earlier conversation messages omitted. Continue from the "
+                        "latest verified state and keep following the original policy.] "
+                        + str(self.session_state.get("history_compression_summary") or "")
+                    ),
+                }
+            ]
+            + extra_system
+            + recent
+        )
 
     def _should_hint_post_tool_summary(self) -> bool:
         last_tool = self.session_state.get("last_tool_name")
@@ -1117,779 +394,1154 @@ class Agent:
             and "Error:" not in latest["content"]
         )
 
-    def _balance_response_from_state(self) -> dict[str, Any]:
-        balances = self.session_state.get("known_payment_balances", {})
-        if not isinstance(balances, dict) or not balances:
-            return self._fallback_action(
-                "Please share your user ID so I can look up the balances on your gift cards and certificates."
-            )
-
-        lines = []
-        for payment_id, amount in sorted(balances.items()):
-            if payment_id.startswith(("gift_card_", "certificate_")):
-                lines.append(f"- {payment_id}: ${amount:.0f}")
-        if not lines:
-            return self._fallback_action(
-                "I couldn't find any gift cards or certificates on file in your profile."
-            )
-        return self._fallback_action(
-            "Here are the gift card and certificate balances I found:\n"
-            + "\n".join(lines)
-        )
-
     def _should_use_plan(self, latest_user_text: str) -> bool:
-        lowered = latest_user_text.lower()
-        if self.turn_count <= 1:
-            return False
         if self.turn_count > PLAN_MAX_TURNS:
-            return False
-        complexity_markers = sum(
-            1
-            for phrase in (
-                " and ",
-                " also ",
-                "cheapest",
-                "fastest",
-                "all upcoming",
-                "all my",
-                "multiple",
-                "same day",
-                "other flight",
-                "change",
-                "cancel",
-                "book",
-            )
-            if phrase in lowered
+            candidate = self.latest_plan.get("next_action") if isinstance(self.latest_plan, dict) else None
+            return should_plan(self.session_state, latest_user_text, candidate)
+        return should_plan(
+            self.session_state,
+            latest_user_text,
+            self.latest_plan.get("next_action") if isinstance(self.latest_plan, dict) else None,
         )
-        return complexity_markers >= 3
 
-    def _infer_reservation_from_inventory(self, text: str) -> str | None:
-        inventory = self.session_state.get("reservation_inventory", {})
-        if not isinstance(inventory, dict) or not inventory:
+    # ------------------------------------------------------------------
+    # Action helpers
+    # ------------------------------------------------------------------
+
+    def _fallback_action(self, content: str) -> dict[str, Any]:
+        return {"name": RESPOND_ACTION_NAME, "arguments": {"content": content}}
+
+    def _trace(self, event: str, **fields: Any) -> None:
+        if not self.debug_logging_enabled:
+            return
+        payload = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            "turn": self.turn_count,
+            "task_type": self.session_state.get("task_type"),
+            "reservation_id": self.session_state.get("reservation_id"),
+            "last_tool_name": self.session_state.get("last_tool_name"),
+            "context_id": self.session_state.get("_context_id"),
+        }
+        payload.update(fields)
+        try:
+            self.debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.debug_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _terminal_cancel_refusal(self, refusal: str) -> dict[str, Any]:
+        text = refusal.strip()
+        lower = text.lower()
+        if "not eligible for cancellation" in lower:
+            text += (
+                " I can’t approve or process this cancellation, and I can’t offer a refund for it."
+            )
+        elif "already cancelled" in lower:
+            text += " There is no further cancellation action for me to process on this booking."
+        self._trace("terminal_cancel_refusal", refusal=text)
+        return self._fallback_action(text)
+
+    def _active_tools(self) -> list[dict[str, Any]]:
+        return list(self.tools or [])
+
+    def _guard_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        if self.messages:
+            latest = self.messages[-1]
+            content = latest.get("content")
+            if latest.get("role") == "user" and isinstance(content, str):
+                self.session_state["latest_input_is_tool"] = content.startswith("tool:")
+        return guard_action(
+            self.session_state,
+            self.tools,
+            self.messages,
+            self.turn_count,
+            action,
+            self._latest_user_text(),
+        )
+
+    def _update_state_from_text(self, input_text: str) -> None:
+        update_state_from_text(self.session_state, input_text)
+
+    def _update_state_from_tool_payload(self, input_text: str) -> None:
+        update_state_from_tool_payload(self.session_state, input_text)
+
+    def _infer_reservation_from_inventory(self, latest_user_text: str) -> str | None:
+        return infer_reservation_from_inventory(self.session_state, latest_user_text)
+
+    def _pre_llm_route_resolution_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        task_type = str(self.session_state.get("task_type") or "general")
+        if task_type not in {"cancel", "modify", "remove_passenger", "insurance"}:
+            return None
+        if not self.session_state.get("loaded_user_details"):
+            return None
+        if extract_reservation_id(latest_user_text) or extract_flight_number(latest_user_text):
             return None
 
-        lowered = text.lower()
-        candidates = list(inventory.items())
+        airport_codes = extract_airport_codes(latest_user_text)
+        target = self.session_state.get("route_resolution_target")
+        if len(airport_codes) >= 2:
+            origin = airport_codes[0]
+            destination = airport_codes[1]
+            self.session_state["origin"] = origin
+            self.session_state["destination"] = destination
+            self.session_state["route_resolution_active"] = True
+            self.session_state["route_resolution_target"] = {
+                "origin": origin,
+                "destination": destination,
+            }
+            self.session_state["route_resolution_queue"] = list(
+                self.session_state.get("known_reservation_ids") or []
+            )
+        elif isinstance(target, dict):
+            origin = target.get("origin")
+            destination = target.get("destination")
+        else:
+            origin = self.session_state.get("origin")
+            destination = self.session_state.get("destination")
 
-        if "last reservation" in lowered or "most recent reservation" in lowered:
-            by_created = [
-                (reservation_id, entry.get("created_at"))
-                for reservation_id, entry in candidates
-                if isinstance(entry, dict) and isinstance(entry.get("created_at"), str)
+        if not isinstance(origin, str) or not isinstance(destination, str):
+            return None
+        if not self.session_state.get("route_resolution_active"):
+            return None
+
+        route_match = find_reservation_by_route(self.session_state, origin, destination)
+        if route_match:
+            self.session_state["reservation_id"] = route_match
+            self._trace(
+                "route_resolution_matched",
+                origin=origin,
+                destination=destination,
+                matched_reservation=route_match,
+            )
+            self.session_state["route_resolution_active"] = False
+            self.session_state["route_resolution_target"] = None
+            self.session_state["route_resolution_queue"] = []
+            if task_type == "cancel":
+                eligible, refusal = cancel_eligibility(
+                    self.session_state,
+                    route_match,
+                    latest_user_text,
+                )
+                self.session_state["cancel_eligible"] = eligible
+                if not eligible and refusal:
+                    return self._terminal_cancel_refusal(refusal)
+            return None
+
+        queue = self.session_state.get("route_resolution_queue", [])
+        inventory = self.session_state.get("reservation_inventory", {})
+        if isinstance(queue, list) and isinstance(inventory, dict):
+            remaining = [
+                reservation_id
+                for reservation_id in queue
+                if isinstance(reservation_id, str) and reservation_id not in inventory
             ]
-            if by_created:
-                by_created.sort(key=lambda item: item[1], reverse=True)
-                return by_created[0][0]
-
-        dates = set(self._extract_dates(text))
-        airport_codes = AIRPORT_CODE_PATTERN.findall(text)
-        current_reservation = self.session_state.get("reservation_id")
-
-        filtered: list[tuple[str, dict[str, Any]]] = []
-        for reservation_id, entry in candidates:
-            if not isinstance(entry, dict):
-                continue
-            if "other flight" in lowered and reservation_id == current_reservation:
-                continue
-            entry_dates = set(entry.get("dates", []))
-            if dates and not dates.intersection(entry_dates):
-                continue
-            if len(airport_codes) >= 2:
-                if entry.get("origin") != airport_codes[0] or entry.get("destination") != airport_codes[1]:
-                    continue
-            filtered.append((reservation_id, entry))
-
-        if len(filtered) == 1:
-            return filtered[0][0]
+            self.session_state["route_resolution_queue"] = remaining
+            if remaining:
+                self._trace(
+                    "route_resolution_fetch_next",
+                    origin=origin,
+                    destination=destination,
+                    next_reservation=remaining[0],
+                    remaining=len(remaining),
+                )
+                return {
+                    "name": "get_reservation_details",
+                    "arguments": {"reservation_id": remaining[0]},
+                }
+        self.session_state["route_resolution_active"] = False
+        self.session_state["route_resolution_target"] = None
+        self.session_state["route_resolution_queue"] = []
+        if task_type == "cancel":
+            self._trace(
+                "route_resolution_no_match",
+                origin=origin,
+                destination=destination,
+            )
+            return self._fallback_action(
+                f"I checked the reservations available on this profile and couldn’t find a booking matching {origin} to {destination}."
+            )
         return None
 
-    def _candidate_tool_names(self, latest_user_text: str) -> set[str] | None:
-        if not self.tools:
+    def _pre_llm_recent_reservation_resolution_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        if not self.session_state.get("loaded_user_details"):
+            return None
+        lowered = latest_user_text.lower()
+        if "last reservation" not in lowered and "most recent reservation" not in lowered:
+            return None
+        if extract_reservation_id(latest_user_text) or extract_flight_number(latest_user_text):
             return None
 
-        names = {tool["function"]["name"] for tool in self.tools if "function" in tool}
-        wanted: set[str] = set()
-        lowered = latest_user_text.lower()
-        task_type = self._task_type(latest_user_text)
-        has_identity = bool(
-            self.session_state.get("reservation_id")
-            or self.session_state.get("user_id")
-            or self._extract_reservation_id(latest_user_text)
-            or self._extract_user_id(latest_user_text)
-        )
+        known_ids = self.session_state.get("known_reservation_ids", [])
+        inventory = self.session_state.get("reservation_inventory", {})
+        if isinstance(known_ids, list) and isinstance(inventory, dict):
+            for reservation_id in known_ids:
+                if isinstance(reservation_id, str) and reservation_id not in inventory:
+                    return {
+                        "name": "get_reservation_details",
+                        "arguments": {"reservation_id": reservation_id},
+                    }
 
-        if self._looks_like_balance_intent(latest_user_text):
-            return set()
+        inferred = infer_reservation_from_inventory(self.session_state, latest_user_text)
+        if isinstance(inferred, str):
+            self.session_state["reservation_id"] = inferred
+            self.session_state["recent_reservation_active"] = True
+            self.session_state["recent_reservation_id"] = inferred
+        return None
 
-        if self._looks_like_status_intent(latest_user_text) or self._looks_like_compensation_intent(
-            latest_user_text
-        ):
-            wanted |= {"get_flight_status", "get_user_details", "get_reservation_details"}
+    def _pre_llm_cancel_post_user_lookup_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        task_type = str(self.session_state.get("task_type") or "general")
+        active_flow = self.session_state.get("active_flow")
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        if task_type != "cancel" and flow_name != "cancel":
+            return None
+        if not self.session_state.get("latest_input_is_tool"):
+            return None
+        if self.session_state.get("last_tool_name") != "get_user_details":
+            return None
+        if not self.session_state.get("loaded_user_details"):
+            return None
 
-        if self._looks_like_baggage_intent(latest_user_text):
-            wanted |= {
-                "get_user_details",
-                "get_reservation_details",
-                "update_reservation_baggages",
-            }
+        recent_user_messages = [
+            str(message.get("content") or "")
+            for message in self.messages[-8:]
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and not str(message.get("content")).startswith("tool:")
+        ]
+        recent_text = "\n".join(recent_user_messages + [latest_user_text]).strip()
+        reservation_id = extract_reservation_id(recent_text)
+        flight_number = extract_flight_number(recent_text)
+        airport_codes = extract_airport_codes(recent_text)
 
-        if self._looks_like_booking_intent(latest_user_text):
-            wanted |= {
-                "list_all_airports",
-                "search_direct_flight",
-                "search_onestop_flight",
-                "book_reservation",
-                "get_user_details",
-                "get_reservation_details",
-                "calculate",
-            }
-
-        if self._looks_like_modify_intent(latest_user_text):
-            wanted |= {
-                "get_user_details",
-                "get_reservation_details",
-                "calculate",
-                "transfer_to_human_agents",
-            }
-            if has_identity:
-                wanted |= {
-                    "search_direct_flight",
-                    "search_onestop_flight",
-                    "update_reservation_flights",
-                    "update_reservation_baggages",
-                }
-
-        if self._looks_like_cancel_intent(latest_user_text):
-            wanted |= {
-                "get_user_details",
-                "get_reservation_details",
-                "transfer_to_human_agents",
-                "get_flight_status",
-            }
-            if has_identity:
-                wanted.add("cancel_reservation")
-
-        if self._looks_like_remove_passenger_intent(latest_user_text) or self._looks_like_insurance_intent(
-            latest_user_text
-        ):
-            wanted |= {"get_user_details", "get_reservation_details", "transfer_to_human_agents"}
-
-        if "human agent" in lowered or "transfer" in lowered:
-            wanted |= {"transfer_to_human_agents"}
-
-        if self.session_state.get("reservation_id"):
-            wanted |= {
-                "get_reservation_details",
-            }
-            if task_type == "cancel":
-                wanted.add("cancel_reservation")
-            if task_type == "modify":
-                wanted.add("update_reservation_flights")
-            if task_type == "baggage":
-                wanted.add("update_reservation_baggages")
-        if self.session_state.get("user_id"):
-            wanted |= {"get_user_details"}
-        if self.session_state.get("known_payment_ids"):
-            wanted |= {"book_reservation", "calculate"}
-        if (
-            task_type in {"booking", "modify"}
-            and has_identity
-            and self.session_state.get("origin")
-            and self.session_state.get("destination")
-        ):
-            wanted |= {"search_direct_flight", "search_onestop_flight"}
-
-        filtered = wanted & names
-        return filtered or names
-
-    def _active_tools(self) -> list[dict[str, Any]] | None:
-        return self.tools or None
-
-    def _looks_like_booking_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in (
-                "book a flight",
-                "book a one-way flight",
-                "book a one way flight",
-                "make a reservation",
-                "make me a reservation",
-                "i'd like to book",
-                "i would like to book",
-                "reserve a flight",
-            )
-        )
-
-    def _looks_like_same_reservation_reference(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in (
-                "same as my current reservation",
-                "same flight that i had",
-                "exactly the same as my current reservation",
-                "my current reservation",
-            )
-        )
-
-    def _looks_like_compensation_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in (
-                "compensation",
-                "certificate",
-                "delayed flight",
-                "canceled flight",
-                "cancelled flight",
-            )
-        )
-
-    def _looks_like_balance_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return "balance" in lowered and (
-            "gift card" in lowered or "certificate" in lowered
-        )
-
-    def _looks_like_baggage_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in (
-                "baggage",
-                "bag allowance",
-                "bags allowed",
-                "how many suitcases",
-                "how many bags",
-                "checked bag",
-                "checked baggage",
-                "suitcases",
-            )
-        )
-
-    def _looks_like_status_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in (
-                "flight status",
-                "status of my flight",
-                "delayed flight",
-                "delay",
-                "canceled flight",
-                "cancelled flight",
-                "is my flight",
-                "what happened to flight",
-            )
-        )
-
-    def _opening_turn_action(self, latest_user_text: str) -> dict[str, Any] | None:
-        reservation_id = self._extract_reservation_id(latest_user_text)
-        user_id = self._extract_user_id(latest_user_text)
-        flight_number = self._extract_flight_number(latest_user_text)
-        task_type = self._task_type(latest_user_text)
-
-        if self._looks_like_balance_intent(latest_user_text):
-            if self.session_state.get("loaded_user_details"):
-                return self._balance_response_from_state()
-            if user_id:
-                return {"name": "get_user_details", "arguments": {"user_id": user_id}}
-            return self._fallback_action(
-                "Please share your user ID so I can look up the balances on your gift cards and certificates."
-            )
-
-        if flight_number and self._looks_like_compensation_intent(latest_user_text):
-            return self._fallback_action(
-                "Please share the flight date as YYYY-MM-DD so I can check the status for compensation eligibility."
-            )
-
-        if reservation_id and not user_id:
+        if isinstance(reservation_id, str):
+            self._trace("cancel_post_user_lookup_explicit_reservation", target=reservation_id)
             return {
                 "name": "get_reservation_details",
                 "arguments": {"reservation_id": reservation_id},
             }
-
-        if self._looks_like_baggage_intent(latest_user_text):
-            if user_id:
-                return {"name": "get_user_details", "arguments": {"user_id": user_id}}
-            if reservation_id:
+        if isinstance(flight_number, str):
+            matched = find_reservation_by_flight_number(self.session_state, flight_number)
+            if isinstance(matched, str):
+                self.session_state["reservation_id"] = matched
+                self._trace(
+                    "cancel_post_user_lookup_flight_match",
+                    flight_number=flight_number,
+                    matched_reservation=matched,
+                )
                 return {
                     "name": "get_reservation_details",
-                    "arguments": {"reservation_id": reservation_id},
+                    "arguments": {"reservation_id": matched},
                 }
-            return self._fallback_action(
-                "Please share your user ID or reservation number so I can check your baggage allowance."
-            )
+        if len(airport_codes) >= 2:
+            return self._pre_llm_route_resolution_action(recent_text)
 
-        if task_type in {"modify", "remove_passenger", "insurance", "cancel"}:
-            if reservation_id:
+        known_ids = [
+            rid
+            for rid in (self.session_state.get("known_reservation_ids") or [])
+            if isinstance(rid, str)
+        ]
+        if looks_like_all_reservations_intent(recent_text):
+            inventory = self.session_state.get("reservation_inventory", {})
+            if not isinstance(inventory, dict):
+                inventory = {}
+            for reservation_id in known_ids:
+                if reservation_id not in inventory:
+                    self._trace(
+                        "cancel_post_user_lookup_iterate_all",
+                        next_reservation=reservation_id,
+                    )
+                    return {
+                        "name": "get_reservation_details",
+                        "arguments": {"reservation_id": reservation_id},
+                    }
+            return None
+        if len(known_ids) == 1:
+            self._trace("cancel_post_user_lookup_single_known_reservation", target=known_ids[0])
+            return {
+                "name": "get_reservation_details",
+                "arguments": {"reservation_id": known_ids[0]},
+            }
+        if len(known_ids) > 1:
+            self._trace("cancel_post_user_lookup_requires_disambiguation", known_reservations=known_ids)
+            return self._fallback_action(
+                "I found multiple reservations on your profile. Tell me which trip you want to cancel by reservation ID, route, or flight number, and I’ll check the correct booking."
+            )
+        return None
+
+    def _pre_llm_cancel_identity_collection_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        task_type = str(self.session_state.get("task_type") or "general")
+        active_flow = self.session_state.get("active_flow")
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        if task_type != "cancel" and flow_name != "cancel":
+            return None
+        if self.session_state.get("latest_input_is_tool"):
+            return None
+        if self.session_state.get("loaded_user_details"):
+            return None
+
+        reservation_id = extract_reservation_id(latest_user_text)
+        flight_number = extract_flight_number(latest_user_text)
+        airport_codes = extract_airport_codes(latest_user_text)
+        if reservation_id or flight_number or len(airport_codes) >= 2:
+            return self._fallback_action(
+                "Please share your user ID, and I’ll use that with the trip details you provided to locate the booking."
+            )
+        return self._fallback_action(
+            "Please share your user ID and either the reservation ID, route, or flight number for the trip you want to cancel."
+        )
+
+    def _pre_llm_cancel_resolution_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        task_type = str(self.session_state.get("task_type") or "general")
+        active_flow = self.session_state.get("active_flow")
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        if task_type != "cancel" and flow_name != "cancel":
+            return None
+        if not self.session_state.get("latest_input_is_tool"):
+            return None
+
+        recent_user_messages = [
+            str(message.get("content") or "")
+            for message in self.messages[-8:]
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and not str(message.get("content")).startswith("tool:")
+        ]
+        recent_text = "\n".join(recent_user_messages + [latest_user_text]).strip()
+        eligibility_context = recent_text or latest_user_text
+        lowered = eligibility_context.lower()
+        last_tool_name = self.session_state.get("last_tool_name")
+
+        if (
+            looks_like_all_reservations_intent(eligibility_context)
+            and last_tool_name in {"get_reservation_details", "cancel_reservation"}
+        ):
+            known_ids = [
+                rid
+                for rid in (self.session_state.get("known_reservation_ids") or [])
+                if isinstance(rid, str)
+            ]
+            inventory = self.session_state.get("reservation_inventory", {})
+            if not isinstance(inventory, dict):
+                inventory = {}
+            for known_id in known_ids:
+                if known_id not in inventory:
+                    self._trace(
+                        "aggregate_cancel_load_remaining",
+                        next_reservation=known_id,
+                        loaded=len(inventory),
+                        total=len(known_ids),
+                    )
+                    return {
+                        "name": "get_reservation_details",
+                        "arguments": {"reservation_id": known_id},
+                    }
+
+            executed = self.session_state.get("executed_actions_by_reservation", {})
+            if not isinstance(executed, dict):
+                executed = {}
+            require_single_passenger = "one passenger" in lowered or "only one passenger" in lowered
+            eligible_ids: list[str] = []
+            for known_id in known_ids:
+                entry = inventory.get(known_id)
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("status") or "").strip().lower() == "cancelled":
+                    continue
+                if reservation_has_flown_segments(self.session_state, known_id) is True:
+                    continue
+                if require_single_passenger and entry.get("passenger_count") != 1:
+                    continue
+                eligible, _ = cancel_eligibility(
+                    self.session_state,
+                    known_id,
+                    eligibility_context,
+                )
+                if eligible:
+                    eligible_ids.append(known_id)
+
+            for eligible_id in eligible_ids:
+                if executed.get(eligible_id) == "cancel_reservation":
+                    continue
+                self.session_state["reservation_id"] = eligible_id
+                self.session_state["cancel_eligible"] = True
+                self._trace(
+                    "aggregate_cancel_execute",
+                    reservation_id=eligible_id,
+                    eligible_count=len(eligible_ids),
+                )
                 return {
-                    "name": "get_reservation_details",
-                    "arguments": {"reservation_id": reservation_id},
+                    "name": "cancel_reservation",
+                    "arguments": {"reservation_id": eligible_id},
                 }
-            if user_id:
-                return {"name": "get_user_details", "arguments": {"user_id": user_id}}
-            if task_type == "remove_passenger":
-                return self._fallback_action(
-                    "Please share your reservation number or user ID so I can locate the booking before I review passenger changes."
+
+            if eligible_ids:
+                cancelled_count = sum(
+                    1 for eligible_id in eligible_ids if executed.get(eligible_id) == "cancel_reservation"
                 )
-            if task_type == "insurance":
                 return self._fallback_action(
-                    "Please share your reservation number or user ID so I can check whether insurance is attached to the booking."
+                    f"I finished reviewing the reservations in scope and cancelled {cancelled_count} eligible booking"
+                    + ("s." if cancelled_count != 1 else ".")
                 )
-            if task_type == "cancel":
+
+            if require_single_passenger:
                 return self._fallback_action(
-                    "Please share your reservation number or user ID so I can locate the booking you want to cancel."
+                    "I reviewed the reservations in scope, and none of the upcoming bookings with only one passenger is eligible for cancellation under the airline policy."
                 )
             return self._fallback_action(
-                "Please share your reservation number or user ID so I can look up the booking before changing it."
+                "I reviewed the reservations in scope, and none of the upcoming bookings is eligible for cancellation under the airline policy."
             )
 
-        if user_id:
-            return {"name": "get_user_details", "arguments": {"user_id": user_id}}
+        if last_tool_name != "get_reservation_details":
+            return None
 
-        if self._looks_like_booking_intent(latest_user_text):
-            airport_codes = AIRPORT_CODE_PATTERN.findall(latest_user_text)
-            if self._looks_like_same_reservation_reference(latest_user_text):
-                return self._fallback_action(
-                    "Please share your user ID or reservation number so I can look up your existing booking."
-                )
-            if len(airport_codes) < 2:
-                return {"name": "list_all_airports", "arguments": {}}
-            return self._fallback_action(
-                "Please share the traveler details and any passenger count or cabin preferences so I can help with the booking."
+        reservation_id = self.session_state.get("reservation_id")
+        entry = current_reservation_entry(self.session_state, reservation_id)
+        if not isinstance(reservation_id, str) or not isinstance(entry, dict):
+            return None
+
+        eligible, refusal = cancel_eligibility(
+            self.session_state,
+            reservation_id,
+            eligibility_context,
+        )
+        self.session_state["cancel_eligible"] = eligible
+        self._trace(
+            "cancel_resolution_evaluated",
+            reservation_id=reservation_id,
+            eligible=eligible,
+            refusal=refusal,
+        )
+        if eligible:
+            return {
+                "name": "cancel_reservation",
+                "arguments": {"reservation_id": reservation_id},
+            }
+
+        if refusal and not refusal.startswith("Please share the reason"):
+            return self._terminal_cancel_refusal(refusal)
+
+        created_at = entry.get("created_at")
+        booked_within_24h = False
+        if isinstance(created_at, str):
+            try:
+                created_dt = datetime.fromisoformat(created_at)
+                booked_within_24h = (BENCHMARK_NOW - created_dt).total_seconds() <= 24 * 3600
+            except ValueError:
+                booked_within_24h = False
+        status = str(entry.get("status") or "").strip().lower()
+        cabin = str(entry.get("cabin") or "").strip().lower()
+        insurance = str(entry.get("insurance") or "").strip().lower()
+        mentions_covered_basis = any(
+            token in lowered
+            for token in (
+                "airline cancelled",
+                "airline canceled",
+                "cancelled flight",
+                "canceled flight",
+                "health",
+                "medical",
+                "ill",
+                "sick",
+                "weather",
+                "storm",
             )
-
-        if self._looks_like_compensation_intent(latest_user_text):
-            return self._fallback_action(
-                "Please share your reservation number, user ID, or flight number so I can review the issue."
+        )
+        impossible_without_override = (
+            not booked_within_24h
+            and status != "cancelled"
+            and cabin != "business"
+            and insurance != "yes"
+        )
+        if impossible_without_override and not mentions_covered_basis:
+            return self._terminal_cancel_refusal(
+                "This reservation is not eligible for cancellation under the airline policy because "
+                "it was not booked within 24 hours, the flight was not cancelled by the airline, "
+                "the cabin is not business class, and the booking does not include travel insurance."
             )
 
         return None
 
-    def _guard_action(self, action: dict[str, Any]) -> dict[str, Any]:
+    def _pre_llm_cancel_user_followup_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        task_type = str(self.session_state.get("task_type") or "general")
+        active_flow = self.session_state.get("active_flow")
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        if task_type != "cancel" and flow_name != "cancel":
+            return None
+        if self.session_state.get("latest_input_is_tool"):
+            return None
+
+        reservation_id = self.session_state.get("reservation_id")
+        entry = current_reservation_entry(self.session_state, reservation_id)
+        if not isinstance(reservation_id, str) or not isinstance(entry, dict):
+            return None
+
+        recent_user_messages = [
+            str(message.get("content") or "")
+            for message in self.messages[-8:]
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and not str(message.get("content")).startswith("tool:")
+        ]
+        eligibility_context = "\n".join(recent_user_messages + [latest_user_text]).strip()
+        eligible, refusal = cancel_eligibility(
+            self.session_state,
+            reservation_id,
+            eligibility_context,
+        )
+        self.session_state["cancel_eligible"] = eligible
+        self._trace(
+            "cancel_followup_evaluated",
+            reservation_id=reservation_id,
+            eligible=eligible,
+            refusal=refusal,
+        )
+        if eligible:
+            return {
+                "name": "cancel_reservation",
+                "arguments": {"reservation_id": reservation_id},
+            }
+        if refusal and not refusal.startswith("Please share the reason"):
+            return self._terminal_cancel_refusal(refusal)
+        return None
+
+    def _pre_llm_adversarial_compensation_verification_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        task_type = str(self.session_state.get("task_type") or "general")
+        active_flow = self.session_state.get("active_flow")
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        if task_type == "cancel" or flow_name == "cancel":
+            return None
+        if not self.session_state.get("loaded_user_details"):
+            return None
+
+        working_memory = self.session_state.get("working_memory", {})
+        if not isinstance(working_memory, dict):
+            working_memory = {}
+
+        # Skip the first message (policy document) — it contains words like
+        # "business class", "cancelled", "compensation" that would spuriously
+        # activate the adversarial-verification path for every task.
+        policy_content = self.messages[0].get("content", "") if self.messages else ""
+        recent_user_messages = [
+            str(message.get("content") or "")
+            for message in self.messages[-10:]
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and not str(message.get("content")).startswith("tool:")
+            and message.get("content") != policy_content
+        ]
+        if not recent_user_messages and not latest_user_text:
+            return None
+        recent_lowered = "\n".join(recent_user_messages + [latest_user_text]).lower()
+
+        compensation_story = any(
+            token in recent_lowered
+            for token in (
+                "compensation",
+                "travel certificate",
+                "missed meeting",
+                "inconvenience",
+            )
+        )
+
+        business_claim = "business" in recent_lowered
+        _cancel_negations = (
+            "not cancel", "not canceled", "not cancelled",
+            "wasn't cancel", "was delayed, not", "delayed, not cancel",
+            "delay not cancel",
+        )
+        cancelled_claim = (
+            ("cancelled" in recent_lowered or "canceled" in recent_lowered)
+            and not any(neg in recent_lowered for neg in _cancel_negations)
+        )
+        verification_active = bool(
+            working_memory.get("adversarial_compensation_verification")
+        )
+        if not compensation_story and not verification_active:
+            return None
+        if compensation_story and (business_claim or cancelled_claim):
+            working_memory["adversarial_compensation_verification"] = True
+            working_memory["adversarial_compensation_business_claim"] = (
+                bool(working_memory.get("adversarial_compensation_business_claim"))
+                or business_claim
+            )
+            working_memory["adversarial_compensation_cancelled_claim"] = (
+                bool(working_memory.get("adversarial_compensation_cancelled_claim"))
+                or cancelled_claim
+            )
+            self.session_state["working_memory"] = working_memory
+            verification_active = True
+        if not verification_active:
+            return None
+        business_claim = bool(
+            working_memory.get("adversarial_compensation_business_claim")
+        ) or business_claim
+        cancelled_claim = bool(
+            working_memory.get("adversarial_compensation_cancelled_claim")
+        ) or cancelled_claim
+
+        known_ids = self.session_state.get("known_reservation_ids", [])
+        inventory = self.session_state.get("reservation_inventory", {})
+        if not isinstance(known_ids, list) or not known_ids or not isinstance(inventory, dict):
+            return None
+
+        for reservation_id in known_ids:
+            if isinstance(reservation_id, str) and reservation_id not in inventory:
+                return {
+                    "name": "get_reservation_details",
+                    "arguments": {"reservation_id": reservation_id},
+                }
+
+        matching_reservations: list[str] = []
+        for reservation_id in known_ids:
+            if not isinstance(reservation_id, str):
+                continue
+            entry = inventory.get(reservation_id)
+            if not isinstance(entry, dict):
+                continue
+            cabin = str(entry.get("cabin") or "").strip().lower()
+            status = str(entry.get("status") or "").strip().lower()
+            if business_claim and cabin != "business":
+                continue
+            if cancelled_claim and status != "cancelled":
+                continue
+            matching_reservations.append(reservation_id)
+
+        if matching_reservations:
+            if len(matching_reservations) == 1:
+                self.session_state["reservation_id"] = matching_reservations[0]
+            working_memory["adversarial_compensation_verification"] = False
+            self.session_state["working_memory"] = working_memory
+            return None
+
+        reservation_count = len([rid for rid in known_ids if isinstance(rid, str)])
+        summary_clause = "all available reservations" if reservation_count <= 0 else (
+            "all 1 reservation on your profile"
+            if reservation_count == 1
+            else f"all {reservation_count} reservations on your profile"
+        )
+        claim_clause = "a cancelled business flight" if business_claim and cancelled_claim else (
+            "a business flight" if business_claim else "a cancelled flight"
+        )
+        return self._fallback_action(
+            f"I reviewed {summary_clause}, and none of them matches {claim_clause}. Because the verified booking details do not support that claim, I can’t offer compensation or cancel anything on that basis."
+        )
+
+    def _pre_llm_status_compensation_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        task_type = str(self.session_state.get("task_type") or "general")
+        active_flow = self.session_state.get("active_flow")
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        lowered_user = latest_user_text.lower()
+        status_context = task_type == "status" or flow_name == "status_compensation"
+        if not status_context:
+            status_context = (
+                self.session_state.get("last_tool_name") == "get_flight_status"
+                or any(
+                    token in lowered_user
+                    for token in (
+                        "delayed flight",
+                        "delay",
+                        "delayed",
+                        "compensation",
+                        "travel certificate",
+                        "flight status",
+                        "status of",
+                    )
+                )
+            )
+        if not status_context:
+            return None
+
+        reservation_id = self.session_state.get("reservation_id")
+        inventory = self.session_state.get("reservation_inventory", {})
+        current_entry = (
+            inventory.get(reservation_id)
+            if isinstance(reservation_id, str) and isinstance(inventory, dict)
+            else None
+        )
+        flights = current_entry.get("flights") if isinstance(current_entry, dict) else None
+        no_change_or_cancel = any(
+            phrase in lowered_user
+            for phrase in (
+                "don't want to change or cancel",
+                "do not want to change or cancel",
+                "not looking to change or cancel",
+                "not looking to cancel",
+                "not looking to change",
+                "no need to cancel or change",
+                "keeping the reservation as-is",
+                "keeping the reservation as is",
+            )
+        )
+        if not no_change_or_cancel:
+            for message in reversed(self.messages[-6:]):
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str) or content.startswith("tool:"):
+                    continue
+                historical = content.lower()
+                if any(
+                    phrase in historical
+                    for phrase in (
+                        "don't want to change or cancel",
+                        "do not want to change or cancel",
+                        "not looking to change or cancel",
+                        "not looking to cancel",
+                        "not looking to change",
+                        "no need to cancel or change",
+                    )
+                ):
+                    no_change_or_cancel = True
+                    break
+        # User explicitly denying they want compensation → treat as no interest
+        _compensation_denial_phrases = (
+            "not looking for compensation",
+            "not asking for compensation",
+            "not looking to claim compensation",
+            "not claiming compensation",
+            "not asking about compensation",
+            "don't want compensation",
+            "do not want compensation",
+            "not interested in compensation",
+        )
+        compensation_denied = any(phrase in lowered_user for phrase in _compensation_denial_phrases)
+        compensation_interest = not compensation_denied and any(
+            token in lowered_user
+            for token in ("compensation", "certificate", "travel certificate", "inconvenience")
+        )
+        recent_user_messages = [
+            str(message.get("content") or "")
+            for message in self.messages[-8:]
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and not str(message.get("content")).startswith("tool:")
+        ]
+        recent_lowered = "\n".join(recent_user_messages).lower()
+        compensation_context = compensation_interest or any(
+            token in recent_lowered
+            for token in ("compensation", "certificate", "travel certificate", "inconvenience")
+        )
+        membership = str(self.session_state.get("membership") or "").strip().lower()
+        cabin = (
+            str(current_entry.get("cabin") or "").strip().lower()
+            if isinstance(current_entry, dict)
+            else ""
+        )
+
+        if not self.session_state.get("latest_input_is_tool"):
+            if no_change_or_cancel and compensation_interest:
+                return self._fallback_action(
+                    "I understand you want to keep the reservation as-is. Under the policy, I can only offer compensation after a delay is confirmed and only when you want to change or cancel the reservation. Since you do not want to change or cancel it, I can’t offer a travel certificate here."
+                )
+            flight_number = extract_flight_number(latest_user_text)
+            mentioned_dates = extract_dates(latest_user_text)
+            if isinstance(flight_number, str):
+                matched_reservation = find_reservation_by_flight_number(
+                    self.session_state, flight_number
+                )
+                if isinstance(matched_reservation, str):
+                    reservation_id = matched_reservation
+                    self.session_state["reservation_id"] = matched_reservation
+                    self.session_state["recent_reservation_active"] = False
+                    self.session_state["recent_reservation_id"] = matched_reservation
+                    current_entry = (
+                        inventory.get(matched_reservation)
+                        if isinstance(inventory, dict)
+                        else None
+                    )
+                    flights = (
+                        current_entry.get("flights")
+                        if isinstance(current_entry, dict)
+                        else None
+                    )
+            if isinstance(flight_number, str) and isinstance(flights, list):
+                for flight in flights:
+                    if (
+                        isinstance(flight, dict)
+                        and flight.get("flight_number") == flight_number
+                        and isinstance(flight.get("date"), str)
+                        and (
+                            not mentioned_dates
+                            or flight.get("date") in mentioned_dates
+                        )
+                    ):
+                        return {
+                            "name": "get_flight_status",
+                            "arguments": {
+                                "flight_number": flight_number,
+                                "date": flight["date"],
+                            },
+                        }
+                for flight in flights:
+                    if (
+                        isinstance(flight, dict)
+                        and flight.get("flight_number") == flight_number
+                        and isinstance(flight.get("date"), str)
+                    ):
+                        return {
+                            "name": "get_flight_status",
+                            "arguments": {
+                                "flight_number": flight_number,
+                                "date": flight["date"],
+                            },
+                        }
+            remembered_flight = self.session_state.get("flight_number")
+            if isinstance(remembered_flight, str) and isinstance(flights, list):
+                # Don't repeat get_flight_status if we already checked this flight
+                # and confirmed it's not delayed — prevents infinite loops under social pressure.
+                # Use the persistent _last_flight_status_checked_flight key which survives
+                # respond actions (unlike last_tool_name which is cleared to None by them).
+                # Use persistent key (survives respond actions that reset last_tool_name)
+                last_checked_flight = self.session_state.get("_last_flight_status_checked_flight")
+                last_status = str(self.session_state.get("last_flight_status_result") or "").lower()
+                if (
+                    last_checked_flight == remembered_flight
+                    and last_status in {"landed", "available", "on time"}
+                ):
+                    return None
+                for flight in flights:
+                    if (
+                        isinstance(flight, dict)
+                        and flight.get("flight_number") == remembered_flight
+                        and isinstance(flight.get("date"), str)
+                    ):
+                        return {
+                            "name": "get_flight_status",
+                            "arguments": {
+                                "flight_number": remembered_flight,
+                                "date": flight["date"],
+                            },
+                        }
+            return None
+
+        if self.session_state.get("last_tool_name") != "get_flight_status":
+            return None
+
+        last_args = self.session_state.get("last_tool_arguments") or {}
+        flight_number = last_args.get("flight_number")
+        flight_date = last_args.get("date")
+        status_result = str(self.session_state.get("last_flight_status_result") or "").strip()
+        if not isinstance(flight_number, str) or not isinstance(flight_date, str) or not status_result:
+            return None
+
+        no_change_or_cancel = no_change_or_cancel or "leave it at that" in lowered_user
+        if compensation_context and not no_change_or_cancel:
+            no_change_or_cancel = not any(
+                token in recent_lowered
+                for token in (
+                    "change flights",
+                    "change my flight",
+                    "cancel the reservation",
+                    "cancel my reservation",
+                    "modify the reservation",
+                )
+            )
+        membership_clause = ""
+        if membership == "regular" and "gold member" in recent_lowered:
+            membership_clause = " I also verified from your profile that you are a Regular member, not a Gold member."
+        if status_result.lower() in {"delayed", "flying", "on time"} and compensation_context and no_change_or_cancel:
+            return self._fallback_action(
+                f"I checked flight {flight_number} on {flight_date}, and the current status is {status_result}.{membership_clause} Because you want to keep the reservation as-is and are not changing or cancelling it, I can’t offer compensation here."
+            )
+        if status_result.lower() in {"available", "landed"}:
+            if no_change_or_cancel or compensation_context:
+                return self._fallback_action(
+                    f"I checked flight {flight_number} on {flight_date}, and the current status is {status_result}. That does not confirm a delay.{membership_clause} Since the delay is not confirmed, I can’t offer compensation here."
+                )
+            return self._fallback_action(
+                f"I checked flight {flight_number} on {flight_date}, and the current status is {status_result}. That does not confirm a delay. If you want, tell me a different flight segment from this reservation to check."
+            )
+        return self._fallback_action(
+            f"I checked flight {flight_number} on {flight_date}, and the current status is {status_result}. If you want to change or cancel the reservation because of that delay, I can help with the next step."
+        )
+
+    def _pricing_expression_for_current_reservation(
+        self, reservation_id: str | None, target_cabin: str | None
+    ) -> str | None:
+        return pricing_expression_for_current_reservation(
+            self.session_state, reservation_id, target_cabin
+        )
+
+    def _normalize_action(self, action: dict[str, Any]) -> dict[str, Any]:
         name = action.get("name")
         arguments = action.get("arguments")
-        if not isinstance(name, str) or not isinstance(arguments, dict):
-            return action
 
+        if not isinstance(name, str) or not name:
+            return self._fallback_action(
+                "I couldn't determine the next safe action. Could you clarify your request?"
+            )
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        if name == RESPOND_ACTION_NAME:
+            arguments = dict(arguments)
+            arguments["content"] = normalize_respond_content(arguments.get("content", ""))
+
+        if self.tool_names and name != RESPOND_ACTION_NAME and name not in self.tool_names:
+            return self._fallback_action(
+                f"I selected an unavailable action ({name}). Please restate what you need."
+            )
+
+        return {"name": name, "arguments": arguments}
+
+    def _process_action_candidate(
+        self,
+        action: dict[str, Any],
+        latest_user_text: str,
+    ) -> dict[str, Any]:
+        action = guard_action(
+            self.session_state,
+            self.tools,
+            self.messages,
+            self.turn_count,
+            self._normalize_action(action),
+            latest_user_text,
+        )
+        action = termination_controller(self.session_state, action, latest_user_text)
+        return {
+            "name": action.get("name"),
+            "arguments": action.get("arguments")
+            if isinstance(action.get("arguments"), dict)
+            else {},
+        }
+
+    def _extract_tools_from_first_turn(self, input_text: str) -> str:
+        if self.turn_count != 1:
+            return input_text
+
+        sanitized = sanitize_tool_descriptions(input_text)
+        tools = extract_openai_tools(sanitized)
+        if tools:
+            self.tools = tools
+            self.tool_names = {t["function"]["name"] for t in tools if "function" in t}
+            print(
+                f"[tau2-agent] extracted {len(tools)} tool schemas "
+                f"for native function calling"
+            )
+        else:
+            names = set(re.findall(r'"name"\s*:\s*"([^"]+)"', sanitized))
+            self.tool_names = names
+            print(
+                f"[tau2-agent] could not extract tool schemas; "
+                f"running in JSON mode with {len(names)} allowed names"
+            )
+        return sanitized
+
+    def _build_turn_graph(self):
+        graph = StateGraph(TurnGraphState)
+        graph.add_node("transfer_hold", self._graph_transfer_hold)
+        graph.add_node("ingest_input", self._graph_ingest_input)
+        graph.add_node("llm_decide", self._graph_llm_decide)
+        graph.add_node("finalize_action", self._graph_finalize_action)
+        graph.add_edge(START, "transfer_hold")
+        graph.add_conditional_edges(
+            "transfer_hold",
+            lambda state: END if state.get("should_return") else "ingest_input",
+        )
+        graph.add_edge("ingest_input", "llm_decide")
+        graph.add_edge("llm_decide", "finalize_action")
+        graph.add_edge("finalize_action", END)
+        return graph.compile()
+
+    def _graph_transfer_hold(self, state: TurnGraphState) -> TurnGraphState:
+        if not self.just_transferred:
+            return {"should_return": False}
+
+        self.just_transferred = False
+        input_text = state["input_text"]
+        self.session_state["latest_input_is_tool"] = input_text.strip().startswith("tool:")
+        action = self._fallback_action(TRANSFER_HOLD_MESSAGE)
+        update_state_from_text(self.session_state, input_text)
+        update_state_from_tool_payload(self.session_state, input_text)
+        self.messages.append({"role": "user", "content": input_text})
+        self.messages.append(
+            {"role": "assistant", "content": json.dumps(action, ensure_ascii=False)}
+        )
+        return {"action": action, "should_return": True}
+
+    def _graph_ingest_input(self, state: TurnGraphState) -> TurnGraphState:
+        input_text = state["input_text"]
+        self.session_state["latest_input_is_tool"] = input_text.strip().startswith("tool:")
+        update_state_from_text(self.session_state, input_text)
+        update_state_from_tool_payload(self.session_state, input_text)
+        sync_runtime_state(self.session_state, input_text)
+        self.messages.append({"role": "user", "content": input_text})
         latest_user_text = self._latest_user_text()
-        task_type = self._task_type(latest_user_text)
-        effective_task_type = (
-            task_type
-            if task_type != "general"
-            else str(self.session_state.get("task_type") or "general")
-        )
-        pending_confirmation_action = self.session_state.get("pending_confirmation_action")
-        if self.turn_count == 2:
-            forced = self._opening_turn_action(latest_user_text)
-            if forced is not None:
-                return forced
+        return {"latest_user_text": latest_user_text, "should_return": False}
 
-        if self._looks_like_balance_intent(latest_user_text) and self.session_state.get(
-            "loaded_user_details"
-        ):
-            return self._balance_response_from_state()
-
-        user_id_from_context = self._extract_user_id(latest_user_text)
-        reservation_id_from_context = self._extract_reservation_id(latest_user_text)
-        flight_number_from_context = self._extract_flight_number(latest_user_text)
-        inferred_reservation_id = self._infer_reservation_from_inventory(latest_user_text)
-        effective_reservation_id = (
-            reservation_id_from_context
-            or inferred_reservation_id
-            or self.session_state.get("reservation_id")
-        )
-        effective_user_id = user_id_from_context or self.session_state.get("user_id")
-        requested_cabin = self.session_state.get("requested_cabin")
-        cabin_only_change = bool(self.session_state.get("cabin_only_change"))
-        lowered_user_text = latest_user_text.lower()
-
+    def _graph_llm_decide(self, state: TurnGraphState) -> TurnGraphState:
+        latest_user_text = state.get("latest_user_text", "")
+        forced_action = self._pre_llm_route_resolution_action(latest_user_text)
+        if forced_action is not None:
+            self._trace("forced_action", source="route_resolution", action=forced_action)
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        forced_action = self._pre_llm_recent_reservation_resolution_action(latest_user_text)
+        if forced_action is not None:
+            self._trace("forced_action", source="recent_reservation", action=forced_action)
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        forced_action = self._pre_llm_cancel_post_user_lookup_action(latest_user_text)
+        if forced_action is not None:
+            self._trace("forced_action", source="cancel_post_user_lookup", action=forced_action)
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        forced_action = self._pre_llm_cancel_identity_collection_action(latest_user_text)
+        if forced_action is not None:
+            self._trace("forced_action", source="cancel_identity_collection", action=forced_action)
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        active_flow = self.session_state.get("active_flow")
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
         if (
-            name == RESPOND_ACTION_NAME
-            and isinstance(effective_reservation_id, str)
-            and isinstance(requested_cabin, str)
-            and any(token in lowered_user_text for token in ("cost", "price", "pricing", "under $", "limit"))
+            (str(self.session_state.get("task_type") or "general") == "cancel" or flow_name == "cancel")
+            and self.session_state.get("latest_input_is_tool")
+            and self.session_state.get("last_tool_name") == "get_user_details"
+            and self.session_state.get("loaded_user_details")
+            and not extract_reservation_id(latest_user_text)
+            and not extract_flight_number(latest_user_text)
+            and len(extract_airport_codes(latest_user_text)) < 2
+            and len(
+                [
+                    rid
+                    for rid in (self.session_state.get("known_reservation_ids") or [])
+                    if isinstance(rid, str)
+                ]
+            ) > 1
         ):
-            missing_search = self._next_missing_pricing_search(effective_reservation_id)
-            if missing_search is not None:
-                return missing_search
-            if self.session_state.get("last_tool_name") != "calculate":
-                expression = self._pricing_expression_for_current_reservation(
-                    effective_reservation_id, requested_cabin
-                )
-                if expression:
-                    return {"name": "calculate", "arguments": {"expression": expression}}
-
-        if (
-            name == RESPOND_ACTION_NAME
-            and effective_task_type == "modify"
-            and isinstance(effective_reservation_id, str)
-            and isinstance(requested_cabin, str)
-            and cabin_only_change
-        ):
-            if (
-                self._looks_like_affirmation(latest_user_text)
-                and pending_confirmation_action == "update_reservation_flights"
-            ):
-                same_flights_action = self._same_flights_update_action(
-                    effective_reservation_id, requested_cabin
-                )
-                if same_flights_action is not None:
-                    return same_flights_action
-            current_entry = self._current_reservation_entry(effective_reservation_id)
-            current_cabin = current_entry.get("cabin") if isinstance(current_entry, dict) else None
-            if isinstance(current_cabin, str) and current_cabin != requested_cabin:
-                if not self.session_state.get("cabin_price_quoted"):
-                    missing_search = self._next_missing_pricing_search(
-                        effective_reservation_id
-                    )
-                    if missing_search is not None:
-                        return missing_search
-                    if self.session_state.get("last_tool_name") != "calculate":
-                        expression = self._pricing_expression_for_current_reservation(
-                            effective_reservation_id, requested_cabin
-                        )
-                        if expression:
-                            return {
-                                "name": "calculate",
-                                "arguments": {"expression": expression},
-                            }
-                confirmation = self._cabin_change_confirmation(
-                    effective_reservation_id, requested_cabin
-                )
-                if confirmation is not None:
-                    return confirmation
-
-        if (
-            name == "get_reservation_details"
-            and effective_task_type == "modify"
-            and isinstance(effective_reservation_id, str)
-            and isinstance(requested_cabin, str)
-            and cabin_only_change
-            and arguments.get("reservation_id") == effective_reservation_id
-            and self._current_reservation_entry(effective_reservation_id) is not None
-        ):
-            if (
-                self._looks_like_affirmation(latest_user_text)
-                and pending_confirmation_action == "update_reservation_flights"
-            ):
-                same_flights_action = self._same_flights_update_action(
-                    effective_reservation_id, requested_cabin
-                )
-                if same_flights_action is not None:
-                    return same_flights_action
-            if not self.session_state.get("cabin_price_quoted"):
-                missing_search = self._next_missing_pricing_search(
-                    effective_reservation_id
-                )
-                if missing_search is not None:
-                    return missing_search
-                if self.session_state.get("last_tool_name") != "calculate":
-                    expression = self._pricing_expression_for_current_reservation(
-                        effective_reservation_id, requested_cabin
-                    )
-                    if expression:
-                        return {
-                            "name": "calculate",
-                            "arguments": {"expression": expression},
-                        }
-            confirmation = self._cabin_change_confirmation(
-                effective_reservation_id, requested_cabin
+            action = self._process_action_candidate(
+                self._fallback_action(
+                    "I found multiple reservations on your profile. Tell me which trip you want to cancel by reservation ID, route, or flight number, and I’ll check the correct booking."
+                ),
+                latest_user_text,
             )
-            if confirmation is not None:
-                return confirmation
+            self._trace("forced_action", source="cancel_disambiguation_guard", action=action)
+            return {"action": action, "latest_user_text": latest_user_text}
+        forced_action = self._pre_llm_cancel_resolution_action(latest_user_text)
+        if forced_action is not None:
+            self._trace("forced_action", source="cancel_resolution", action=forced_action)
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        forced_action = self._pre_llm_cancel_user_followup_action(latest_user_text)
+        if forced_action is not None:
+            self._trace("forced_action", source="cancel_followup", action=forced_action)
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        forced_action = self._pre_llm_adversarial_compensation_verification_action(latest_user_text)
+        if forced_action is not None:
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        forced_action = self._pre_llm_status_compensation_action(latest_user_text)
+        if forced_action is not None:
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        action = self._process_action_candidate(self._call_llm(), latest_user_text)
+        return {"action": action, "latest_user_text": latest_user_text}
 
-        if (
-            name == self.session_state.get("last_tool_name")
-            and arguments == self.session_state.get("last_tool_arguments")
-            and latest_user_text == self.session_state.get("last_tool_user_text")
+    def _graph_finalize_action(self, state: TurnGraphState) -> TurnGraphState:
+        action = state["action"]
+        latest_user_text = state.get("latest_user_text", "")
+
+        previous_name = self.session_state.get("last_tool_name")
+        previous_arguments = self.session_state.get("last_tool_arguments")
+        previous_user_text = self.session_state.get("last_tool_user_text")
+        self.session_state["last_tool_name"] = (
+            action.get("name") if action.get("name") != RESPOND_ACTION_NAME else None
+        )
+        self.session_state["last_tool_arguments"] = (
+            action.get("arguments") if action.get("name") != RESPOND_ACTION_NAME else None
+        )
+        self.session_state["last_tool_user_text"] = latest_user_text
+        # Persist flight status check result separately so the loop-protection
+        # in _pre_llm_status_compensation_action survives a subsequent respond
+        # action (which clears last_tool_name / last_tool_arguments).
+        if action.get("name") == "get_flight_status":
+            args = action.get("arguments") or {}
+            self.session_state["_last_flight_status_checked_flight"] = args.get("flight_number")
+            self.session_state["_last_flight_status_checked_date"] = args.get("date")
+        if action.get("name") == RESPOND_ACTION_NAME:
+            self.session_state["last_tool_streak"] = 0
+        elif (
+            self.session_state["last_tool_name"] == previous_name
+            and self.session_state["last_tool_arguments"] == previous_arguments
+            and latest_user_text == previous_user_text
         ):
-            if (
-                name in {"get_user_details", "get_reservation_details", "get_flight_status"}
-                and int(self.session_state.get("last_tool_streak") or 0) >= 2
-            ):
-                return self._fallback_action(
-                    "I already checked that record. Please share a different reservation number, user ID, or clarify what should happen next."
-                )
+            self.session_state["last_tool_streak"] = int(
+                self.session_state.get("last_tool_streak") or 0
+            ) + 1
+        else:
+            self.session_state["last_tool_streak"] = 1
 
-        if name == "get_flight_status":
-            if effective_task_type == "modify" and isinstance(effective_reservation_id, str):
-                has_flown_segments = self._reservation_has_flown_segments(
-                    effective_reservation_id
-                )
-                if has_flown_segments is False:
-                    missing_search = self._next_missing_pricing_search(
-                        effective_reservation_id
-                    )
-                    if missing_search is not None:
-                        return missing_search
-                    if isinstance(requested_cabin, str):
-                        expression = self._pricing_expression_for_current_reservation(
-                            effective_reservation_id, requested_cabin
-                        )
-                        if expression and self.session_state.get("last_tool_name") != "calculate":
-                            return {
-                                "name": "calculate",
-                                "arguments": {"expression": expression},
-                            }
-                    return self._fallback_action(
-                        "The reservation flights are all still upcoming, so I can continue without checking flight status."
-                    )
-            proposed_flight_number = arguments.get("flight_number")
-            if not flight_number_from_context or not self._looks_like_status_intent(
-                latest_user_text
-            ):
-                return self._fallback_action(
-                    "Please share the flight number and whether you're asking about a delay, cancellation, or flight status."
-                )
-            if proposed_flight_number != flight_number_from_context:
-                arguments = dict(arguments)
-                arguments["flight_number"] = flight_number_from_context
-                arguments.setdefault("date", "2024-05-15")
-                return {"name": "get_flight_status", "arguments": arguments}
+        remember_pending_confirmation(self.session_state, action)
+        clear_pending_confirmation_if_completed(self.session_state, action)
+        record_completed_action(self.session_state, action)
+        resolve_completed_subtasks(self.session_state, action)
+        sync_runtime_state(self.session_state, latest_user_text)
 
-        if name == "get_user_details":
-            proposed_user_id = arguments.get("user_id")
-            if isinstance(proposed_user_id, str):
-                lowered = proposed_user_id.lower()
-                if "placeholder" in lowered:
-                    proposed_user_id = None
-            else:
-                proposed_user_id = None
+        if action.get("name") == "transfer_to_human_agents":
+            self.just_transferred = True
 
-            if reservation_id_from_context and not user_id_from_context:
-                return {
-                    "name": "get_reservation_details",
-                    "arguments": {"reservation_id": reservation_id_from_context},
-                }
-            if user_id_from_context and proposed_user_id != user_id_from_context:
-                return {
-                    "name": "get_user_details",
-                    "arguments": {"user_id": user_id_from_context},
-                }
-            if not user_id_from_context:
-                return self._fallback_action(
-                    "Please share your user ID or reservation number so I can look up your booking."
-                )
-            if proposed_user_id and RESERVATION_ID_PATTERN.fullmatch(proposed_user_id):
-                return {
-                    "name": "get_reservation_details",
-                    "arguments": {"reservation_id": proposed_user_id},
-                }
-            if not proposed_user_id:
-                return self._fallback_action(
-                    "Please share your user ID or reservation number so I can look up your booking."
-                )
+        self.messages.append(
+            {"role": "assistant", "content": json.dumps(action, ensure_ascii=False)}
+        )
+        return {"action": action}
 
-        if name == "get_reservation_details":
-            proposed_reservation_id = arguments.get("reservation_id")
-            if (
-                effective_task_type == "modify"
-                and isinstance(effective_reservation_id, str)
-                and isinstance(requested_cabin, str)
-                and proposed_reservation_id == effective_reservation_id
-                and self._current_reservation_entry(effective_reservation_id) is not None
-            ):
-                missing_search = self._next_missing_pricing_search(effective_reservation_id)
-                if missing_search is not None:
-                    return missing_search
-                if not self.session_state.get("cabin_price_quoted"):
-                    expression = self._pricing_expression_for_current_reservation(
-                        effective_reservation_id, requested_cabin
-                    )
-                    if expression:
-                        return {"name": "calculate", "arguments": {"expression": expression}}
-            if (
-                isinstance(proposed_reservation_id, str)
-                and FLIGHT_NUMBER_PATTERN.fullmatch(proposed_reservation_id)
-            ):
-                return self._fallback_action(
-                    "That looks like a flight number, not a reservation number. Please share your reservation number or user ID so I can look up the booking."
-                )
-            if not isinstance(proposed_reservation_id, str) or not proposed_reservation_id:
-                if inferred_reservation_id:
-                    return {
-                        "name": "get_reservation_details",
-                        "arguments": {"reservation_id": inferred_reservation_id},
-                    }
-                if reservation_id_from_context:
-                    return {
-                        "name": "get_reservation_details",
-                        "arguments": {"reservation_id": reservation_id_from_context},
-                    }
-                return self._fallback_action(
-                    "Please share your reservation number so I can look up the booking details."
-                )
-
-        if name in {"search_direct_flight", "search_onestop_flight"}:
-            if effective_task_type not in {"booking", "modify"}:
-                return self._fallback_action(
-                    "Please share your reservation number or user ID so I can locate the booking before searching for replacement flights."
-                )
-            if effective_task_type == "modify" and not effective_reservation_id and not effective_user_id:
-                return self._fallback_action(
-                    "Please share your reservation number or user ID so I can look up the booking before searching for replacement flights."
-                )
-            if (
-                effective_task_type == "modify"
-                and isinstance(effective_reservation_id, str)
-                and isinstance(requested_cabin, str)
-                and name == "search_direct_flight"
-            ):
-                proposed_origin = arguments.get("origin")
-                proposed_destination = arguments.get("destination")
-                proposed_date = arguments.get("date")
-                if not self._matches_reservation_segment(
-                    effective_reservation_id,
-                    proposed_origin if isinstance(proposed_origin, str) else None,
-                    proposed_destination if isinstance(proposed_destination, str) else None,
-                    proposed_date if isinstance(proposed_date, str) else None,
-                ):
-                    missing_search = self._next_missing_pricing_search(
-                        effective_reservation_id
-                    )
-                    if missing_search is not None:
-                        return missing_search
-                    return self._fallback_action(
-                        "I need to check the existing reservation segments before searching for cabin availability."
-                    )
-
-        if name == "cancel_reservation":
-            if effective_task_type != "cancel" and pending_confirmation_action != "cancel_reservation":
-                return self._fallback_action(
-                    "I can only cancel a reservation after an explicit cancellation request."
-                )
-            if not effective_reservation_id:
-                return self._fallback_action(
-                    "Please share your reservation number so I can cancel the correct booking."
-                )
-            is_eligible, refusal = self._cancel_eligibility(
-                effective_reservation_id, latest_user_text
-            )
-            if not is_eligible:
-                return self._fallback_action(
-                    refusal
-                    or "This reservation is not eligible for cancellation under the airline policy."
-                )
-            if arguments.get("reservation_id") != effective_reservation_id:
-                return {
-                    "name": "cancel_reservation",
-                    "arguments": {"reservation_id": effective_reservation_id},
-                }
-
-        if name == "update_reservation_flights":
-            if effective_task_type != "modify" and pending_confirmation_action != "update_reservation_flights":
-                return self._fallback_action(
-                    "I can only change flights or cabins after an explicit modification request."
-                )
-            if not effective_reservation_id:
-                return self._fallback_action(
-                    "Please share your reservation number or user ID so I can look up the booking before changing it."
-                )
-            current_entry = self._current_reservation_entry(effective_reservation_id)
-            current_cabin = current_entry.get("cabin") if isinstance(current_entry, dict) else None
-            if (
-                isinstance(requested_cabin, str)
-                and isinstance(current_cabin, str)
-                and current_cabin != requested_cabin
-                and not self.session_state.get("cabin_price_quoted")
-            ):
-                missing_search = self._next_missing_pricing_search(effective_reservation_id)
-                if missing_search is not None:
-                    return missing_search
-                expression = self._pricing_expression_for_current_reservation(
-                    effective_reservation_id, requested_cabin
-                )
-                if expression:
-                    return {"name": "calculate", "arguments": {"expression": expression}}
-            if (
-                isinstance(requested_cabin, str)
-                and any(
-                    token in lowered_user_text
-                    for token in ("cost", "price", "pricing", "under $", "budget", "before i confirm")
-                )
-            ):
-                missing_search = self._next_missing_pricing_search(effective_reservation_id)
-                if missing_search is not None:
-                    return missing_search
-                expression = self._pricing_expression_for_current_reservation(
-                    effective_reservation_id, requested_cabin
-                )
-                if expression:
-                    return {"name": "calculate", "arguments": {"expression": expression}}
-
-        if name == "update_reservation_baggages":
-            if (
-                effective_task_type == "modify"
-                and isinstance(effective_reservation_id, str)
-                and isinstance(requested_cabin, str)
-                and cabin_only_change
-            ):
-                same_flights_action = self._same_flights_update_action(
-                    effective_reservation_id, requested_cabin
-                )
-                if same_flights_action is not None:
-                    return same_flights_action
-            if effective_task_type != "baggage" and pending_confirmation_action != "update_reservation_baggages":
-                return self._fallback_action(
-                    "I can only change baggage after an explicit baggage request."
-                )
-            if not effective_reservation_id:
-                return self._fallback_action(
-                    "Please share your reservation number or user ID so I can look up the booking before changing baggage."
-                )
-            if not self._current_membership() and isinstance(effective_user_id, str):
-                return {"name": "get_user_details", "arguments": {"user_id": effective_user_id}}
-            total_baggages = arguments.get("total_baggages")
-            if isinstance(total_baggages, int):
-                normalized_nonfree = self._normalized_nonfree_baggages(
-                    effective_reservation_id, total_baggages
-                )
-                if normalized_nonfree is not None:
-                    normalized_arguments = dict(arguments)
-                    normalized_arguments["nonfree_baggages"] = normalized_nonfree
-                    payment_id = normalized_arguments.get("payment_id")
-                    if not isinstance(payment_id, str) or not payment_id:
-                        inferred_payment_id = self._reservation_payment_id(effective_reservation_id)
-                        if inferred_payment_id:
-                            normalized_arguments["payment_id"] = inferred_payment_id
-                    if normalized_arguments != arguments:
-                        return {
-                            "name": "update_reservation_baggages",
-                            "arguments": normalized_arguments,
-                        }
-
-        return action
+    # ------------------------------------------------------------------
+    # LLM call
+    # ------------------------------------------------------------------
 
     def _call_llm(self) -> dict[str, Any]:
-        active_tools = self._active_tools()
+        active_tools = self.tools or None
         messages = self._messages_for_model()
+        plan_data: dict[str, Any] | None = None
         if self._should_use_plan(self._latest_user_text()):
             try:
                 plan_completion = litellm.completion(
                     model=self.model,
                     messages=messages
-                    + [
-                        {
-                            "role": "user",
-                            "content": (
-                                "Think briefly about the policy, missing facts, and the single "
-                                "best next action. Do not output JSON yet."
-                            ),
-                        }
-                    ],
+                        + [
+                            {"role": "user", "content": plan_prompt(history_snapshot(self.session_state))}
+                        ],
                     temperature=self.temperature,
                 )
                 plan_text = (
                     getattr(plan_completion.choices[0].message, "content", None) or ""
                 ).strip()
-                if plan_text:
+                plan_data = parse_plan(plan_text)
+                if plan_data and not planner_conflicts_with_state(self.session_state, plan_data):
+                    self.latest_plan = plan_data
                     messages = messages + [
                         {
                             "role": "system",
-                            "content": "Reasoning scratchpad from previous pass: " + plan_text[:1200],
+                            "content": (
+                                "Structured planner output for this turn: "
+                                + json.dumps(plan_data, ensure_ascii=False)
+                            ),
+                        }
+                    ]
+                elif plan_text:
+                    messages = messages + [
+                        {
+                            "role": "system",
+                            "content": "Planner output was discarded because it conflicted with the current runtime state.",
                         }
                     ]
             except Exception:
@@ -1906,23 +1558,39 @@ class Agent:
         else:
             kwargs["response_format"] = {"type": "json_object"}
 
-        try:
-            completion = litellm.completion(**kwargs)
-        except Exception as exc:
-            print(f"[tau2-agent] LLM call failed: {exc}")
-            # Retry once without response_format/tools in case the model rejected them.
+        completion = None
+        retry_attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(1, retry_attempts + 1):
             try:
-                minimal_kwargs = {
-                    "model": self.model,
-                    "messages": self._messages_for_model(),
-                    "temperature": self.temperature,
-                }
-                completion = litellm.completion(**minimal_kwargs)
-            except Exception as exc2:
-                print(f"[tau2-agent] LLM retry failed: {exc2}")
-                return self._fallback_action(
-                    "I ran into an internal issue. Could you repeat the last request?"
-                )
+                completion = litellm.completion(**kwargs)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                print(f"[tau2-agent] LLM call failed (attempt {attempt}/{retry_attempts}): {exc}")
+
+        if completion is None:
+            minimal_kwargs = {
+                "model": self.model,
+                "messages": self._messages_for_model(),
+                "temperature": self.temperature,
+            }
+            for attempt in range(1, retry_attempts + 1):
+                try:
+                    completion = litellm.completion(**minimal_kwargs)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    print(
+                        f"[tau2-agent] LLM retry failed (attempt {attempt}/{retry_attempts}): {exc}"
+                    )
+
+        if completion is None:
+            return self._fallback_action(
+                "I ran into an internal issue. Could you repeat the last request?"
+            )
 
         choice = completion.choices[0].message
         tool_calls = getattr(choice, "tool_calls", None) or []
@@ -1946,7 +1614,7 @@ class Agent:
                 return {"name": name, "arguments": args}
 
         text = getattr(choice, "content", None) or ""
-        parsed = _extract_json_object(text)
+        parsed = extract_json_object(text)
         if isinstance(parsed, dict) and isinstance(parsed.get("name"), str):
             name = parsed["name"]
             args = parsed.get("arguments") or {}
@@ -1954,8 +1622,18 @@ class Agent:
                 args = {}
             if name == RESPOND_ACTION_NAME:
                 args = dict(args)
-                args["content"] = _normalize_respond_content(args.get("content", ""))
-            return {"name": name, "arguments": args}
+                args["content"] = normalize_respond_content(args.get("content", ""))
+            action = {"name": name, "arguments": args}
+            if plan_data and isinstance(plan_data.get("next_action"), dict):
+                planned_name = plan_data["next_action"].get("name")
+                if isinstance(planned_name, str) and planned_name in {
+                    "cancel_reservation",
+                    "update_reservation_flights",
+                    "update_reservation_baggages",
+                    "book_reservation",
+                }:
+                    action["__planned_write__"] = planned_name
+            return action
 
         stripped = text.strip()
         if stripped:
@@ -1977,7 +1655,7 @@ class Agent:
                 retry_text = (
                     getattr(retry_completion.choices[0].message, "content", None) or ""
                 )
-                retry_parsed = _extract_json_object(retry_text)
+                retry_parsed = extract_json_object(retry_text)
                 if isinstance(retry_parsed, dict) and isinstance(
                     retry_parsed.get("name"), str
                 ):
@@ -1986,7 +1664,7 @@ class Agent:
                         retry_args = {}
                     if retry_parsed["name"] == RESPOND_ACTION_NAME:
                         retry_args = dict(retry_args)
-                        retry_args["content"] = _normalize_respond_content(
+                        retry_args["content"] = normalize_respond_content(
                             retry_args.get("content", "")
                         )
                     return {"name": retry_parsed["name"], "arguments": retry_args}
@@ -1994,110 +1672,23 @@ class Agent:
                 pass
         return self._fallback_action(stripped or "Could you clarify your request?")
 
-    def _normalize_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        name = action.get("name")
-        arguments = action.get("arguments")
-
-        if not isinstance(name, str) or not name:
-            return self._fallback_action(
-                "I couldn't determine the next safe action. Could you clarify your request?"
-            )
-        if not isinstance(arguments, dict):
-            arguments = {}
-
-        if name == RESPOND_ACTION_NAME:
-            arguments = dict(arguments)
-            arguments["content"] = _normalize_respond_content(arguments.get("content", ""))
-
-        if self.tool_names and name != RESPOND_ACTION_NAME and name not in self.tool_names:
-            return self._fallback_action(
-                f"I selected an unavailable action ({name}). Please restate what you need."
-            )
-
-        return {"name": name, "arguments": arguments}
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         input_text = self._normalize_input_prefix(get_message_text(message))
         self.turn_count += 1
-
-        if self.turn_count == 1:
-            tools = _extract_openai_tools(input_text)
-            if tools:
-                self.tools = tools
-                self.tool_names = {
-                    t["function"]["name"] for t in tools if "function" in t
-                }
-                print(
-                    f"[tau2-agent] extracted {len(tools)} tool schemas "
-                    f"for native function calling"
-                )
-            else:
-                # Fallback: grep all "name" occurrences to at least know which actions
-                # are allowed so we can reject hallucinated tool names.
-                names = set(re.findall(r'"name"\s*:\s*"([^"]+)"', input_text))
-                self.tool_names = names
-                print(
-                    f"[tau2-agent] could not extract tool schemas; "
-                    f"running in JSON mode with {len(names)} allowed names"
-                )
+        input_text = self._extract_tools_from_first_turn(input_text)
+        self._trace("turn_start", input=input_text[:400])
 
         await updater.update_status(
             TaskState.working,
             new_agent_text_message("Selecting next action..."),
         )
-
-        # Two-step transfer: after transfer_to_human_agents, send the required hold
-        # message on the next turn regardless of what the LLM would otherwise do.
-        if self.just_transferred:
-            self.just_transferred = False
-            action = self._fallback_action(TRANSFER_HOLD_MESSAGE)
-            self._update_state_from_text(input_text)
-            self._update_state_from_tool_payload(input_text)
-            self.messages.append({"role": "user", "content": input_text})
-            self.messages.append(
-                {"role": "assistant", "content": json.dumps(action, ensure_ascii=False)}
-            )
-            await updater.add_artifact(
-                parts=[Part(root=DataPart(data=action))],
-                name="Action",
-            )
-            return
-
-        self._update_state_from_text(input_text)
-        self._update_state_from_tool_payload(input_text)
-        self.messages.append({"role": "user", "content": input_text})
-        action = self._guard_action(self._normalize_action(self._call_llm()))
-        previous_name = self.session_state.get("last_tool_name")
-        previous_arguments = self.session_state.get("last_tool_arguments")
-        previous_user_text = self.session_state.get("last_tool_user_text")
-        self.session_state["last_tool_name"] = (
-            action.get("name") if action.get("name") != RESPOND_ACTION_NAME else None
-        )
-        self.session_state["last_tool_arguments"] = (
-            action.get("arguments") if action.get("name") != RESPOND_ACTION_NAME else None
-        )
-        self.session_state["last_tool_user_text"] = latest_user_text = self._latest_user_text()
-        if action.get("name") == RESPOND_ACTION_NAME:
-            self.session_state["last_tool_streak"] = 0
-        elif (
-            self.session_state["last_tool_name"] == previous_name
-            and self.session_state["last_tool_arguments"] == previous_arguments
-            and latest_user_text == previous_user_text
-        ):
-            self.session_state["last_tool_streak"] = int(
-                self.session_state.get("last_tool_streak") or 0
-            ) + 1
-        else:
-            self.session_state["last_tool_streak"] = 1
-        self._remember_pending_confirmation(action)
-        self._clear_pending_confirmation_if_completed(action)
-
-        if action.get("name") == "transfer_to_human_agents":
-            self.just_transferred = True
-
-        self.messages.append(
-            {"role": "assistant", "content": json.dumps(action, ensure_ascii=False)}
-        )
+        result = self._turn_graph.invoke({"input_text": input_text})
+        action = result["action"]
+        self._trace("turn_action", action=action)
         await updater.add_artifact(
             parts=[Part(root=DataPart(data=action))],
             name="Action",

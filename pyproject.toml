@@ -11,6 +11,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
   "a2a-sdk[http-server]>=0.3.20",
   "httpx>=0.28.1",
+  "langgraph>=0.2.76",
   "litellm>=1.81.11",
   "python-dotenv>=1.0.1",
   "uvicorn>=0.38.0",
@@ -24,3 +25,11 @@ test = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[dependency-groups]
+dev = [
+    "gymnasium>=1.2.3",
+    "loguru>=0.7.3",
+    "pandas>=3.0.2",
+    "toml>=0.10.2",
+]

@@ -6,7 +6,8 @@
 - [`agent-template`](https://github.com/RDI-Foundation/agent-template)
 - [`agentbeats-tutorial/scenarios/tau2/agent`](https://github.com/RDI-Foundation/agentbeats-tutorial/tree/main/scenarios/tau2/agent)
 
-Здесь сохранен тот же A2A scaffold, который ожидает AgentBeats, но baseline-логика заменена на более аккуратный `policy-first` agent:
+Здесь сохранен тот же A2A scaffold, который ожидает AgentBeats, но baseline-логика заменена на более аккуратный `policy-first` agent на базе `langgraph`:
+- явный turn graph вместо ручного orchestration loop;
 - отдельный шаг анализа перед действием;
 - более жесткое требование к JSON action output;
 - валидация имени действия;
@@ -18,6 +19,9 @@
 ```text
 src/
 ├─ agent.py
+├─ guard.py
+├─ runtime.py
+├─ session_state.py
 ├─ executor.py
 └─ server.py
 tests/
@@ -38,7 +42,13 @@ run.sh
 - история диалога;
 - результаты tool calls.
 
-В ответ этот агент возвращает A2A artifact с JSON формата:
+Внутри одного хода агент прогоняет сообщение через `langgraph` pipeline:
+1. `transfer_hold` — обязательный второй шаг после `transfer_to_human_agents`;
+2. `ingest_input` — обновление session state и runtime facts;
+3. `llm_decide` — planner + model call;
+4. `finalize_action` — guard rails, post-processing и запись action в историю.
+
+В ответ агент возвращает A2A artifact с JSON формата:
 
 ```json
 {
@@ -64,6 +74,12 @@ run.sh
 uv sync
 export OPENAI_API_KEY=...
 uv run src/server.py --host 127.0.0.1 --port 9019
+```
+
+Если только что добавил `langgraph` в окружение, сначала обнови зависимости:
+
+```bash
+uv sync
 ```
 
 Проверка A2A card:

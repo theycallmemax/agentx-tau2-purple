@@ -125,6 +125,23 @@ def test_guard_action_blocks_hallucinated_user_id_not_present_in_context():
     assert "user ID or reservation number" in action["arguments"]["content"]
 
 
+def test_guard_action_rejects_example_user_id_even_after_policy_examples():
+    agent = Agent()
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "My user ID is raj_sanchez_7340. Please cancel my booking."',
+        }
+    )
+    action = agent._guard_action(
+        {"name": "get_user_details", "arguments": {"user_id": "sara_doe_496"}}
+    )
+    assert action == {
+        "name": "get_user_details",
+        "arguments": {"user_id": "raj_sanchez_7340"},
+    }
+
+
 def test_opening_turn_routes_reservation_number_to_lookup():
     agent = Agent()
     agent.turn_count = 2
@@ -333,6 +350,25 @@ def test_guard_action_blocks_flight_number_used_as_reservation_id():
     )
     assert action["name"] == RESPOND_ACTION_NAME
     assert "flight number" in action["arguments"]["content"]
+
+
+def test_messages_for_model_injects_verified_entities_constraints():
+    agent = Agent()
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": 'User message: "My user ID is raj_sanchez_7340 and reservation is EHGLP3."',
+        }
+    )
+
+    messages = agent._messages_for_model()
+    joined = "\n".join(
+        msg["content"] for msg in messages if isinstance(msg.get("content"), str)
+    )
+
+    assert "Verified entities from the user conversation" in joined
+    assert "raj_sanchez_7340" in joined
+    assert "EHGLP3" in joined
 
 
 def test_inventory_can_infer_other_reservation_by_date():
