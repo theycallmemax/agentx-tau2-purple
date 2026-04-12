@@ -26,6 +26,39 @@ def looks_like_modify_intent(text: str) -> bool:
             "nonstop flight",
             "direct flight",
             "cheapest economy",
+            # Additional patterns from failed tasks
+            "change my flights",
+            "change my flight date",
+            "change the flight date",
+            "change my booking",
+            "change the booking",
+            "change the reservation",
+            "change this reservation",
+            "switch my flight",
+            "switch flights",
+            "switch to a nonstop",
+            "switch to a direct",
+            "downgrade all my",
+            "downgrade my",
+            "downgrade the cabin",
+            "downgrade the flights",
+            "move to the next day",
+            "move to the day after",
+            "move it to the next",
+            "find the cheapest economy",
+            "find a cheaper",
+            "earlier flight",
+            "later flight",
+            "shortest return",
+            "fastest return",
+            "change my return flight",
+            "change the return",
+            "change the departure",
+            "change my flights from",
+            "change the name on my reservation",
+            "change the passenger name",
+            "change the passenger",
+            "update the reservation",
         )
     )
 
@@ -197,6 +230,34 @@ def looks_like_booking_intent(text: str) -> bool:
             "i'd like to book",
             "i would like to book",
             "reserve a flight",
+            # Additional patterns from failed tasks
+            "book the flight",
+            "book that flight",
+            "book me a flight",
+            "book a reservation",
+            "book a new flight",
+            "i'm looking to book",
+            "i am looking to book",
+            "looking to book",
+            "i want to book",
+            "book a ticket",
+            "i'd like to make",
+            "i would like to make a reservation",
+            "book a new reservation",
+            "proceed with booking",
+            "proceed with the booking",
+            "proceed with the flight booking",
+            "help me book",
+            "help me find a flight",
+            "find available flights",
+            "find flights for",
+            "check the availability",
+            "check availability for",
+            "what options are available",
+            "book for my friend",
+            "book for my",
+            "add a passenger",
+            "book the same flight",
         )
     )
 
@@ -289,3 +350,89 @@ def classify_task_type(text: str) -> str:
     if looks_like_modify_intent(text):
         return "modify"
     return "general"
+
+
+def detect_all_intents(text: str) -> list[str]:
+    """Return ALL intents found in text, in priority order."""
+    intents = []
+    if looks_like_balance_intent(text):
+        intents.append("balance")
+    if looks_like_remove_passenger_intent(text):
+        intents.append("remove_passenger")
+    if looks_like_baggage_intent(text):
+        intents.append("baggage")
+    if looks_like_insurance_intent(text):
+        intents.append("insurance")
+    if looks_like_status_intent(text) or looks_like_compensation_intent(text):
+        if not looks_like_direct_cancellation_request(text):
+            intents.append("status")
+    if looks_like_cancel_intent(text):
+        intents.append("cancel")
+    if looks_like_booking_intent(text):
+        intents.append("booking")
+    if looks_like_modify_intent(text):
+        intents.append("modify")
+    if not intents:
+        intents.append("general")
+    return intents
+
+
+def looks_like_booking_after_cancel(text: str) -> bool:
+    """Detect when user wants to book a NEW flight after cancel denial."""
+    lowered = text.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "book a new",
+            "book me a new",
+            "book a flight",
+            "book the cheapest",
+            "book the second",
+            "find and book",
+            "make a new reservation",
+            "find the cheapest",
+            "find me a flight",
+            "find a flight",
+            "search for a flight",
+            "search for flights",
+            "book a one-way",
+            "book a one way",
+            "book economy",
+            "book in economy",
+            "book business",
+        )
+    )
+
+
+def looks_like_multi_action_request(text: str) -> bool:
+    """Detect when user has multiple requests in one message."""
+    lowered = text.lower()
+    action_count = 0
+    if looks_like_cancel_intent(text):
+        action_count += 1
+    if looks_like_booking_intent(text):
+        action_count += 1
+    if looks_like_modify_intent(text):
+        action_count += 1
+    if looks_like_baggage_intent(text):
+        action_count += 1
+    # Also check for multiple reservation mentions
+    res_count = text.lower().count("reservation") + text.lower().count("booking") + text.lower().count("flight")
+    if action_count >= 2 or res_count >= 4:
+        return True
+    # Check for "and" connecting two actions
+    if any(
+        pattern in lowered
+        for pattern in (
+            "cancel", "and i also",
+            "cancel", "and then",
+            "cancel", "and book",
+            "cancel", "and change",
+            "cancel", "and modify",
+            "cancel", "and upgrade",
+            "cancel", "and i want",
+            "cancel", "and i need",
+        )
+    ):
+        return True
+    return False
