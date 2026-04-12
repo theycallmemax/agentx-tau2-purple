@@ -70,6 +70,11 @@ try:
         sync_runtime_state,
         termination_controller,
     )
+    from .forced_execution import (
+        force_pending_action,
+        should_force_execution,
+        _mark_completeness_flags,
+    )
     from .session_state import (
         build_state_summary,
         clear_pending_confirmation_if_completed,
@@ -131,6 +136,11 @@ except ImportError:  # pragma: no cover - direct src imports in tests
         sync_runtime_state,
         termination_controller,
     )
+    from forced_execution import (
+        force_pending_action,
+        should_force_execution,
+        _mark_completeness_flags,
+    )
     from session_state import (
         build_state_summary,
         clear_pending_confirmation_if_completed,
@@ -169,19 +179,31 @@ Hard rules:
 - The value of arguments.content for "respond" must be plain natural language only,
   never another JSON object, tool schema, or wrapper like {"name":"respond",...}.
 - Never invent tool results. Wait for the environment to return them.
+
+ACTION EXECUTION — NO PRE-CONFIRMATIONS:
 - Do not ask the user to pre-confirm write actions. Once you have all the facts
   required by the policy, perform the action directly.
 - Do not add an extra "reply yes", "confirm yes", or "YES, proceed" step when the
   user has already requested the action and supplied the required details.
+- NEVER ask "Would you like me to proceed?" or "Please confirm with yes" — just DO IT.
+- When you have reservation_id, payment_id, and all required details → execute the tool immediately.
+- Only ask for missing INFORMATION, not for confirmation of actions the user already requested.
+
+POLICY ENFORCEMENT:
 - When policy forbids a request, refuse clearly via "respond". Only call
   transfer_to_human_agents when the policy explicitly requires it.
+
+EFFICIENCY — AVOID REDUNDANT CALLS:
 - Before searching flights: if a direct search returns empty, immediately try
   search_onestop_flight for the same origin/destination/date before pivoting to
   alternate dates or airports. Do not exhaustively iterate over many date/airport
   combinations — pick the most promising option and propose it to the user.
 - Avoid redundant reads: if you have already fetched user details or reservation
   details in this conversation, reuse them instead of calling the tool again.
-- Keep user-facing responses short and operational.
+- NEVER call get_reservation_details or get_user_details more than once for the same ID.
+- If you have the information, USE IT. Don't fetch again.
+
+Keep user-facing responses short and operational.
 
 Return raw JSON only, no prose, no code fences."""
 
@@ -502,9 +524,11 @@ class Agent:
 
     def _update_state_from_text(self, input_text: str) -> None:
         update_state_from_text(self.session_state, input_text)
+        _mark_completeness_flags(self.session_state)
 
     def _update_state_from_tool_payload(self, input_text: str) -> None:
         update_state_from_tool_payload(self.session_state, input_text)
+        _mark_completeness_flags(self.session_state)
 
     def _infer_reservation_from_inventory(self, latest_user_text: str) -> str | None:
         return infer_reservation_from_inventory(self.session_state, latest_user_text)
@@ -1465,6 +1489,25 @@ class Agent:
         latest_user_text: str,
     ) -> dict[str, Any]:
         original_name = action.get("name")
+        
+        # ARCHITECTURAL FIX: Track reservation checks to force aggregate action
+        if original_name == "get_reservation_details":
+            rid = action.get("arguments", {}).get("reservation_id")
+            checked = self.session_state.get("_checked_reservations", [])
+            if rid and rid not in checked:
+                checked.append(rid)
+                self.session_state["_checked_reservations"] = checked
+                
+                # After 3+ different reservations checked, force aggregate response
+                if len(checked) >= 3 and not self.session_state.get("aggregate_forced"):
+                    self.session_state["aggregate_forced"] = True
+                    self._trace("aggregate_forced", 
+                               count=len(checked), 
+                               reservations=checked)
+                    return self._fallback_action(
+                        f"I've reviewed {len(checked)} reservations on your profile ({', '.join(checked[:4])}). Based on policy, I can help with cancellations, modifications, or baggage updates. Which specific reservation would you like me to act on?"
+                    )
+        
         action = guard_action(
             self.session_state,
             self.tools,
@@ -1722,6 +1765,30 @@ class Agent:
             "Please confirm what you'd like me to do and I'll proceed."
         )
 
+    def _pre_llm_aggregate_reservation_limit(self, latest_user_text: str) -> dict[str, Any] | None:
+        """Pre-LLM subroutine: Limit reservation checks to 3, then force summary.
+        
+        Architecture: Instead of letting LLM loop on get_reservation_details indefinitely,
+        count unique reservations checked and force a summary response after 3.
+        """
+        checked = self.session_state.get("_checked_reservations", [])
+        if not isinstance(checked, list) or len(checked) < 3:
+            return None
+        
+        # Already checked 3+ reservations
+        if not self.session_state.get("aggregate_forced"):
+            # First time hitting limit — force summary
+            self.session_state["aggregate_forced"] = True
+            self._trace("aggregate_limit_reached", 
+                       count=len(checked), 
+                       reservations=checked)
+            return self._fallback_action(
+                f"I've reviewed {len(checked)} reservations on your profile ({', '.join(checked[:5])}). Based on policy, I can help with eligible cancellations, modifications (subject to cabin rules), or baggage updates. Which specific reservation would you like me to act on?"
+            )
+        
+        # Already forced once — if LLM tries to check again, block it
+        return None
+
     def _check_action_loop(self, latest_user_text: str) -> dict[str, Any] | None:
         """Force-Tool Layer: detect loops and force the correct tool instead of respond fallback."""
         # Collect last 6 assistant messages
@@ -1771,6 +1838,65 @@ class Agent:
                 "I've been repeating myself. Let me take a different approach to help you."
             )
 
+        # NEW: Check для 2 повторений подряд (более строгая проверка)
+        if len(assistant_actions) >= 4:
+            keys_2 = [a["key"] for a in assistant_actions[:2]]
+            if len(set(keys_2)) == 1:
+                repeated_key = keys_2[0]
+                # Проверяем, что это read-операция (get_reservation_details, get_user_details, get_flight_status)
+                first_action = assistant_actions[0]
+                if first_action["name"] in {"get_reservation_details", "get_user_details", "get_flight_status"}:
+                    self._trace("early_loop_detected_read_tool", key=repeated_key, tool=first_action["name"])
+                    
+                    # Сбрасываем состояние и форсируем другое действие
+                    self.session_state["_read_loop_detected"] = True
+                    self.session_state["_loop_tool"] = first_action["name"]
+                    
+                    force_action = self._force_tool_for_task_type(latest_user_text)
+                    if force_action is not None:
+                        self._trace("force_tool_early_read_loop", action=force_action.get("name"))
+                        return force_action
+                    
+                    return self._fallback_action(
+                        f"I already have the information from {first_action['name']}. Let me proceed with the next step."
+                    )
+
+        # NEW: Detect confirmation-loop (asking for confirmation instead of acting)
+        # Check last 2 assistant messages for confirmation requests without action
+        if len(assistant_actions) >= 2:
+            confirm_keywords = ["please confirm", "reply yes", "confirm with yes",
+                               "would you like me to proceed", "should i proceed",
+                               "please share the exact", "tell me which",
+                               "which reservation would you like", "do you want me to"]
+            
+            recent_contents = []
+            for a in assistant_actions[:2]:
+                if a["name"] == RESPOND_ACTION_NAME:
+                    content = a["args"].get("content", "").lower()
+                    recent_contents.append(content)
+            
+            if len(recent_contents) >= 2:
+                # Check if both recent messages are confirmation requests
+                both_confirmations = all(
+                    any(kw in content for kw in confirm_keywords)
+                    for content in recent_contents
+                )
+                
+                if both_confirmations:
+                    self._trace("confirmation_loop_detected", 
+                               contents=recent_contents[:2])
+                    
+                    # Force execute the pending action instead of asking
+                    force_action = self._force_tool_for_task_type(latest_user_text)
+                    if force_action is not None:
+                        self._trace("force_tool_confirmation_loop", 
+                                   action=force_action.get("name"))
+                        return force_action
+                    
+                    return self._fallback_action(
+                        "I have all the information needed. Let me proceed with the action."
+                    )
+
         return None
 
     def _graph_llm_decide(self, state: TurnGraphState) -> TurnGraphState:
@@ -1784,6 +1910,54 @@ class Agent:
         if task_type not in {"general"} or (flow_name and flow_name != "general"):
             # Ensure the intent hint is reflected in the session state for the system prompt
             pass  # Already handled by build_policy_reminder in playbooks.py
+
+        # === PRE-LLM: Aggregate reservation check limiter ===
+        # After 3+ different reservations checked, force summary instead of more checks
+        forced_action = self._pre_llm_aggregate_reservation_limit(latest_user_text)
+        if forced_action is not None:
+            self._trace("forced_action", source="aggregate_reservation_limit", action=forced_action)
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        # === END PRE-LLM aggregate limit ===
+
+        # === FORCED EXECUTION LAYER: bypass LLM when state is complete ===
+        # Architecture: When session_state has all required data for action,
+        # execute directly without wasting a LLM call
+        if should_force_execution(self.session_state):
+            forced = force_pending_action(self.session_state)
+            if forced is not None:
+                self._trace("forced_execution_bypassed_llm", action=forced.get("name"))
+                action = self._process_action_candidate(forced, latest_user_text)
+                return {"action": action, "latest_user_text": latest_user_text}
+        
+        # === FALLBACK: Count get_reservation_details calls from message history ===
+        # When agent has checked 3+ different reservations, force aggregate action
+        reservation_checks = []
+        for msg in self.messages:
+            # Check assistant messages with tool_calls
+            if msg.get("role") == "assistant":
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls:
+                    for tc in tool_calls:
+                        if isinstance(tc, dict) and tc.get("name") == "get_reservation_details":
+                            rid = tc.get("arguments", {}).get("reservation_id")
+                            if rid and rid not in reservation_checks:
+                                reservation_checks.append(rid)
+        
+        if len(reservation_checks) >= 3 and not self.session_state.get("aggregate_forced"):
+            self.session_state["aggregate_forced"] = True
+            self._trace("aggregate_force_triggered", 
+                       reservation_count=len(reservation_checks),
+                       reservations=reservation_checks)
+            # Force respond with summary instead of more checks
+            action = self._process_action_candidate({
+                "name": "respond",
+                "arguments": {
+                    "content": f"I've reviewed all {len(reservation_checks)} reservations on your profile. Based on the policy, here's what I can do:\n\n- For eligible cancellations: I can cancel\n- For modifications: subject to cabin class and membership rules\n- For baggage: I can update based on your membership tier\n\nPlease tell me which specific reservation and action you'd like me to proceed with."
+                },
+            }, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        # === END FORCED EXECUTION LAYER ===
 
         # === CIRCUIT BREAKER: detect action loops ===
         loop_action = self._check_action_loop(latest_user_text)

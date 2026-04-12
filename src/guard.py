@@ -1134,17 +1134,46 @@ def guard_action(
                     }
 
     # --- duplicate tool call detection ---
+    # УЛУЧШЕНИЕ: Уменьшили порог с 3 до 2 повторений для read-операций
     if (
         name == state.get("last_tool_name")
         and arguments == state.get("last_tool_arguments")
         and latest_user_text == state.get("last_tool_user_text")
     ):
+        # Для read-операций достаточно 2 повторений
+        read_tools = {"get_user_details", "get_reservation_details", "get_flight_status"}
+        threshold = 2 if name in read_tools else 3
+        
         if (
-            name in {"get_user_details", "get_reservation_details", "get_flight_status"}
-            and int(state.get("last_tool_streak") or 0) >= 2
+            name in read_tools
+            and int(state.get("last_tool_streak") or 0) >= threshold
+        ):
+            # УЛУЧШЕНИЕ: Более информативные сообщения
+            if name == "get_reservation_details":
+                return fallback_action(
+                    "I already have this reservation details. Let me proceed with the next step based on the information I have."
+                )
+            elif name == "get_user_details":
+                return fallback_action(
+                    "I already have your user profile information. Let me continue with helping you based on what I know."
+                )
+            elif name == "get_flight_status":
+                return fallback_action(
+                    "I already checked this flight status. Let me move forward with the next step."
+                )
+            else:
+                return fallback_action(
+                    f"I already checked that record. Please share different information or clarify what should happen next."
+                )
+
+        # УЛУЧШЕНИЕ: Даже если пользователь изменился, но инструмент тот же с теми же аргументами - блокируем
+        if (
+            name == state.get("last_tool_name")
+            and arguments == state.get("last_tool_arguments")
+            and int(state.get("last_tool_streak") or 0) >= threshold
         ):
             return fallback_action(
-                "I already checked that record. Please share a different reservation number, user ID, or clarify what should happen next."
+                f"I'm repeating the same check. Let me take a different approach to help you."
             )
 
     # --- get_flight_status ---
