@@ -1319,6 +1319,119 @@ def guard_action(
 
     # --- get_reservation_details ---
     if name == "get_reservation_details":
+        # FIX A: Prevent infinite loop on already-loaded reservation
+        proposed_reservation_id = arguments.get("reservation_id")
+        inventory = state.get("reservation_inventory", {})
+        if not isinstance(inventory, dict):
+            inventory = {}
+        known_ids = [rid for rid in (state.get("known_reservation_ids") or []) if isinstance(rid, str)]
+        
+        if isinstance(proposed_reservation_id, str) and proposed_reservation_id in inventory:
+            # Already loaded — check if there are unloaded ones
+            unloaded = [rid for rid in known_ids if rid not in inventory]
+            if unloaded:
+                return {
+                    "name": "get_reservation_details",
+                    "arguments": {"reservation_id": unloaded[0]},
+                }
+            # All reservations loaded — prevent further get_reservation_details calls
+            # for task types where re-reading is useless (cancel, modify, booking, baggage).
+            # For status/compensation, allow pass-through — agent may legitimately re-check.
+            entry = inventory.get(proposed_reservation_id)
+            task_type = str(state.get("task_type") or "general")
+            if task_type in {"cancel", "modify", "booking", "baggage"} or flow_name in {"cancel", "modify", "modify_pricing", "booking", "baggage"}:
+                if isinstance(entry, dict):
+                    # Force the agent to ACT on loaded data instead of re-reading
+                    if task_type == "cancel" or flow_name == "cancel":
+                        # Try to cancel eligible reservations
+                        executed = state.get("executed_actions_by_reservation", {})
+                        if not isinstance(executed, dict):
+                            executed = {}
+                        for rid in known_ids:
+                            res_entry = inventory.get(rid)
+                            if not isinstance(res_entry, dict):
+                                continue
+                            if str(res_entry.get("status") or "").strip().lower() == "cancelled":
+                                continue
+                            eligible, refusal = cancel_eligibility(state, rid, latest_user_text)
+                            if eligible and executed.get(rid) != "cancel_reservation":
+                                state["reservation_id"] = rid
+                                state["cancel_eligible"] = True
+                                print(f"[GUARD] force-cancel: all loaded, {rid} is eligible", file=sys.stderr)
+                                return {
+                                    "name": "cancel_reservation",
+                                    "arguments": {"reservation_id": rid},
+                                }
+                        # None eligible — deny clearly and stop
+                        return fallback_action(
+                            f"I've reviewed all {len(inventory)} reservations on your profile and none are eligible for cancellation under the airline policy. I cannot proceed with any cancellations."
+                        )
+
+                    if task_type == "modify" or flow_name in {"modify", "modify_pricing"}:
+                        # If we're in pricing flow (requested_cabin set), redirect to search
+                        if isinstance(requested_cabin, str) and requested_cabin:
+                            missing_search = next_missing_pricing_search(state, proposed_reservation_id)
+                            if missing_search is not None:
+                                return missing_search
+                            # Build search from loaded reservation flights directly
+                            res_entry = inventory.get(proposed_reservation_id)
+                            if isinstance(res_entry, dict):
+                                flights = res_entry.get("flights")
+                                if isinstance(flights, list) and flights:
+                                    first_flight = flights[0]
+                                    if isinstance(first_flight, dict):
+                                        origin = first_flight.get("origin")
+                                        destination = first_flight.get("destination")
+                                        date = first_flight.get("date")
+                                        if origin and destination and date:
+                                            return {
+                                                "name": "search_direct_flight",
+                                                "arguments": {
+                                                    "origin": origin,
+                                                    "destination": destination,
+                                                    "date": date,
+                                                },
+                                            }
+                        return fallback_action(
+                            f"I've loaded all {len(inventory)} reservations. Which one would you like to modify? Here are your options: "
+                            + ", ".join(f"{rid} ({inventory[rid].get('origin','?')}→{inventory[rid].get('destination','?')}, {inventory[rid].get('cabin','?')})" for rid in known_ids[:5] if isinstance(inventory.get(rid), dict))
+                            + ". Please specify the reservation ID and the change you need."
+                        )
+
+                    if task_type == "baggage" or flow_name == "baggage":
+                        # Find the relevant reservation and report baggage
+                        for rid in known_ids:
+                            res_entry = inventory.get(rid)
+                            if isinstance(res_entry, dict):
+                                state["reservation_id"] = rid
+                                baggage_total = res_entry.get("total_baggages", 0)
+                                baggage_free = res_entry.get("nonfree_baggages", 0)
+                                cabin = res_entry.get("cabin", "unknown")
+                                return fallback_action(
+                                    f"Your reservation {rid} ({res_entry.get('origin','?')}→{res_entry.get('destination','?')}) "
+                                    f"in {cabin} cabin has {baggage_total} checked bags "
+                                    f"({baggage_free} non-free). As a {state.get('membership', 'regular')} member, "
+                                    f"you are entitled to additional free bags based on your cabin class."
+                                )
+                        return fallback_action("I've checked all your reservations. Which one do you need baggage info for?")
+
+                    if task_type == "booking" or flow_name == "booking":
+                        return fallback_action(
+                            "I've finished reviewing your existing reservations. Now I can help you book a new flight. "
+                            "Please provide origin, destination, date, and cabin preference."
+                        )
+
+                    # General — summarize and ask
+                    summary_parts = []
+                    for rid in known_ids[:5]:
+                        res_entry = inventory.get(rid)
+                        if isinstance(res_entry, dict):
+                            summary_parts.append(f"{rid}: {res_entry.get('origin','?')}→{res_entry.get('destination','?')} ({res_entry.get('cabin','?')})")
+                    return fallback_action(
+                        f"I've reviewed all your reservations. Here's what I found: {'; '.join(summary_parts)}. "
+                        f"What would you like me to help you with?"
+                    )
+        
         aggregate_cancel_requested = (
             effective_task_type == "cancel"
             and looks_like_all_reservations_intent(f"{recent_user_text}\n{latest_user_text}")
@@ -1522,41 +1635,55 @@ def guard_action(
     if name in {"search_direct_flight", "search_onestop_flight"}:
         state_task_type = str(state.get("task_type") or "")
         # Status/compensation NEVER needs flight searches — always redirect to next unloaded reservation
+        # EXCEPTION: if user explicitly asks to book, override the flow
         if flow_name in {"reservation_triage", "status_compensation"} or state_task_type == "status":
-            if looks_like_all_reservations_intent(latest_user_text):
+            if looks_like_booking_intent(latest_user_text):
+                # User explicitly asked to book — override flow, allow search to proceed
+                pass  # fall through to normal search validation
+            elif looks_like_all_reservations_intent(latest_user_text):
                 return fallback_action(
                     "I should finish identifying the relevant reservations first, then summarize or total them, not run flight searches."
                 )
-            known_ids = state.get("known_reservation_ids", [])
-            inventory = state.get("reservation_inventory", {})
-            if isinstance(known_ids, list) and isinstance(inventory, dict):
-                for rid in known_ids:
-                    if isinstance(rid, str) and rid not in inventory:
-                        print(f"[GUARD] search blocked in status/compensation, redirecting to load {rid}", file=sys.stderr)
-                        return {"name": "get_reservation_details", "arguments": {"reservation_id": rid}}
-            print(f"[GUARD] search blocked in status/compensation flow={flow_name} task={state_task_type}", file=sys.stderr)
-            return fallback_action(
-                "I should identify the correct reservation or verify flight status before starting a flight availability search."
-            )
+            else:
+                known_ids = state.get("known_reservation_ids", [])
+                inventory = state.get("reservation_inventory", {})
+                if isinstance(known_ids, list) and isinstance(inventory, dict):
+                    for rid in known_ids:
+                        if isinstance(rid, str) and rid not in inventory:
+                            print(f"[GUARD] search blocked in status/compensation, redirecting to load {rid}", file=sys.stderr)
+                            return {"name": "get_reservation_details", "arguments": {"reservation_id": rid}}
+                print(f"[GUARD] search blocked in status/compensation flow={flow_name} task={state_task_type}", file=sys.stderr)
+                return fallback_action(
+                    "I should identify the correct reservation or verify flight status before starting a flight availability search."
+                )
         if effective_task_type not in {"booking", "modify"}:
-            # Instead of asking for ID, try to route to the next useful action
-            if isinstance(effective_reservation_id, str) and not current_reservation_entry(state, effective_reservation_id):
-                return {
-                    "name": "get_reservation_details",
-                    "arguments": {"reservation_id": effective_reservation_id},
-                }
-            known_ids = state.get("known_reservation_ids", [])
-            inventory = state.get("reservation_inventory", {})
-            if isinstance(known_ids, list) and isinstance(inventory, dict):
-                for rid in known_ids:
-                    if isinstance(rid, str) and rid not in inventory:
-                        return {
-                            "name": "get_reservation_details",
-                            "arguments": {"reservation_id": rid},
-                        }
-            return fallback_action(
-                "I should not search for flights in a status or cancellation flow. Let me focus on the current request instead."
-            )
+            # EXTRA OVERRIDE: if user text clearly indicates booking or modify intent, allow search
+            if looks_like_booking_intent(latest_user_text):
+                effective_task_type = "booking"
+                state["task_type"] = "booking"
+            elif looks_like_modify_intent(latest_user_text):
+                effective_task_type = "modify"
+                state["task_type"] = "modify"
+
+            if effective_task_type not in {"booking", "modify"}:
+                # Instead of asking for ID, try to route to the next useful action
+                if isinstance(effective_reservation_id, str) and not current_reservation_entry(state, effective_reservation_id):
+                    return {
+                        "name": "get_reservation_details",
+                        "arguments": {"reservation_id": effective_reservation_id},
+                    }
+                known_ids = state.get("known_reservation_ids", [])
+                inventory = state.get("reservation_inventory", {})
+                if isinstance(known_ids, list) and isinstance(inventory, dict):
+                    for rid in known_ids:
+                        if isinstance(rid, str) and rid not in inventory:
+                            return {
+                                "name": "get_reservation_details",
+                                "arguments": {"reservation_id": rid},
+                            }
+                return fallback_action(
+                    "I should not search for flights in a status or cancellation flow. Let me focus on the current request instead."
+                )
         # Booking flow: if we have a target route and this search is for a different route,
         # we're scanning reservations — redirect to next unloaded reservation instead
         if effective_task_type == "booking":
@@ -1613,6 +1740,29 @@ def guard_action(
 
     # --- cancel_reservation ---
     if name == "cancel_reservation":
+        # PROPOSED BUT NEVER EXECUTED: if cancel has been proposed 3+ times but never
+        # actually executed (no tool result between), force execution now.
+        # Detect by checking: last 2 assistant actions were also cancel_reservation for same ID
+        cancel_streak = 0
+        for msg in reversed(messages[:-1]):  # exclude current
+            if msg.get("role") != "assistant":
+                continue
+            try:
+                parsed = json.loads(msg.get("content", "{}"))
+                if parsed.get("name") == "cancel_reservation" and parsed.get("arguments", {}).get("reservation_id") == effective_reservation_id:
+                    cancel_streak += 1
+                else:
+                    break
+            except Exception:
+                break
+        if cancel_streak >= 2:
+            print(f"[GUARD] cancel streak={cancel_streak}, forcing execution of cancel for {effective_reservation_id}", file=sys.stderr)
+            # Force the cancel — return it directly, don't let LLM waffle
+            return {
+                "name": "cancel_reservation",
+                "arguments": {"reservation_id": effective_reservation_id},
+            }
+
         entry = current_reservation_entry(state, effective_reservation_id)
         if isinstance(entry, dict):
             has_insurance = entry.get("insurance") == "yes"

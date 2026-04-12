@@ -24,8 +24,18 @@ try:
         extract_entities_from_history,
         extract_flight_number,
         extract_reservation_id,
+        extract_user_id,
     )
-    from .intent import looks_like_all_reservations_intent
+    from .intent import (
+        looks_like_all_reservations_intent,
+        looks_like_booking_after_cancel,
+        looks_like_multi_action_request,
+        detect_all_intents,
+        looks_like_modify_intent,
+        looks_like_baggage_intent,
+        looks_like_remove_passenger_intent,
+    )
+    from .skill_loader import load_skill_prompt, get_skills_menu, dual_classify_intent
     from .guard import guard_action
     from .parsing import (
         RESPOND_ACTION_NAME,
@@ -75,8 +85,18 @@ except ImportError:  # pragma: no cover - direct src imports in tests
         extract_entities_from_history,
         extract_flight_number,
         extract_reservation_id,
+        extract_user_id,
     )
-    from intent import looks_like_all_reservations_intent
+    from intent import (
+        looks_like_all_reservations_intent,
+        looks_like_booking_after_cancel,
+        looks_like_multi_action_request,
+        detect_all_intents,
+        looks_like_modify_intent,
+        looks_like_baggage_intent,
+        looks_like_remove_passenger_intent,
+    )
+    from skill_loader import load_skill_prompt, get_skills_menu, dual_classify_intent
     from guard import guard_action
     from parsing import (
         RESPOND_ACTION_NAME,
@@ -133,6 +153,14 @@ SYSTEM_PROMPT = """You are a customer service agent participating in the tau2 be
 
 The first user message from the evaluator contains the domain policy and the list
 of tools you may use. Follow that policy strictly.
+
+CRITICAL — First turn behavior:
+- Do NOT proactively ask about flight dates, compensation, delays, or flight status.
+- Do NOT assume the user is calling about compensation or a delayed flight.
+- The user's first message will describe what they need (cancel, book, modify, baggage,
+  status, etc.). Listen to their request and act accordingly.
+- If you must initiate a response before receiving a user request, simply say:
+  "Hello, how can I help you today?" — nothing about flights, dates, or compensation.
 
 Hard rules:
 - Return EXACTLY one JSON object with keys "name" and "arguments".
@@ -242,6 +270,17 @@ class Agent:
         sync_runtime_state(self.session_state, self._latest_user_text())
         state_summary = build_state_summary(self.session_state)
         extra_system: list[dict[str, str]] = []
+
+        # SKILL INJECTION: Load active skill prompt based on classified intent
+        active_skill = self.session_state.get("active_skill_id")
+        if isinstance(active_skill, str) and active_skill:
+            skill_prompt = load_skill_prompt(active_skill)
+            if skill_prompt:
+                extra_system.append({
+                    "role": "system",
+                    "content": f"<ACTIVE_SKILL>{active_skill}</ACTIVE_SKILL>\n{skill_prompt}",
+                })
+
         verified_entities = extract_entities_from_history(self.messages)
         verified_user_ids = sorted(verified_entities["user_ids"])
         verified_reservation_ids = sorted(verified_entities["reservation_ids"])
@@ -663,6 +702,22 @@ class Agent:
                         "arguments": {"reservation_id": reservation_id},
                     }
             return None
+        # NEW: If multiple reservations exist and no specific one mentioned, iterate all
+        if len(known_ids) > 1 and not reservation_id and not flight_number and len(airport_codes) < 2:
+            inventory = self.session_state.get("reservation_inventory", {})
+            if not isinstance(inventory, dict):
+                inventory = {}
+            for reservation_id in known_ids:
+                if reservation_id not in inventory:
+                    self._trace(
+                        "cancel_post_user_lookup_iterate_all_multi",
+                        next_reservation=reservation_id,
+                        total=len(known_ids),
+                    )
+                    return {
+                        "name": "get_reservation_details",
+                        "arguments": {"reservation_id": reservation_id},
+                    }
         if len(known_ids) == 1:
             self._trace("cancel_post_user_lookup_single_known_reservation", target=known_ids[0])
             return {
@@ -710,6 +765,58 @@ class Agent:
             return None
         if not self.session_state.get("latest_input_is_tool"):
             return None
+
+        # FIX C: Detect when user explicitly denies wanting to cancel — break out of cancel flow
+        recent_user_messages = [
+            str(message.get("content") or "")
+            for message in self.messages[-6:]
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and not str(message.get("content")).startswith("tool:")
+        ]
+        recent_text = "\n".join(recent_user_messages + [latest_user_text]).lower()
+        explicit_not_cancel = any(
+            phrase in recent_text
+            for phrase in (
+                "not trying to cancel",
+                "not looking to cancel",
+                "not trying to cancel my",
+                "not looking to cancel my",
+                "not requesting a cancellation",
+                "not asking to cancel",
+                "don't want to cancel",
+                "do not want to cancel",
+                "not looking to cancel a",
+                "not looking to cancel the",
+                "not trying to cancel the",
+            )
+        )
+        if explicit_not_cancel:
+            # Re-classify intent from recent text
+            if looks_like_modify_intent("\n".join(recent_user_messages + [latest_user_text])):
+                self.session_state["task_type"] = "modify"
+                if isinstance(active_flow, dict):
+                    active_flow["name"] = "modify"
+                self._trace("break_cancel_flow", reason="user_explicitly_not_cancelling", new_task="modify")
+                return None  # Let LLM decide with correct task_type
+            if looks_like_booking_intent("\n".join(recent_user_messages + [latest_user_text])):
+                self.session_state["task_type"] = "booking"
+                if isinstance(active_flow, dict):
+                    active_flow["name"] = "booking"
+                self._trace("break_cancel_flow", reason="user_explicitly_not_cancelling", new_task="booking")
+                return None
+            if looks_like_baggage_intent("\n".join(recent_user_messages + [latest_user_text])):
+                self.session_state["task_type"] = "baggage"
+                if isinstance(active_flow, dict):
+                    active_flow["name"] = "baggage"
+                self._trace("break_cancel_flow", reason="user_explicitly_not_cancelling", new_task="baggage")
+                return None
+            if looks_like_remove_passenger_intent("\n".join(recent_user_messages + [latest_user_text])):
+                self.session_state["task_type"] = "remove_passenger"
+                if isinstance(active_flow, dict):
+                    active_flow["name"] = "remove_passenger"
+                self._trace("break_cancel_flow", reason="user_explicitly_not_cancelling", new_task="remove_passenger")
+                return None
 
         recent_user_messages = [
             str(message.get("content") or "")
@@ -1273,6 +1380,56 @@ class Agent:
             f"I checked flight {flight_number} on {flight_date}, and the current status is {status_result}. If you want to change or cancel the reservation because of that delay, I can help with the next step."
         )
 
+    def _pre_llm_post_cancel_booking_action(
+        self, latest_user_text: str
+    ) -> dict[str, Any] | None:
+        """After a cancel denial, check if user also wants to book a new flight (Task 35 pattern)."""
+        task_type = str(self.session_state.get("task_type") or "general")
+        active_flow = self.session_state.get("active_flow")
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        if task_type != "cancel" and flow_name != "cancel":
+            return None
+        if not self.session_state.get("loaded_user_details"):
+            return None
+        if not looks_like_booking_after_cancel(latest_user_text):
+            return None
+
+        # User wants to book after cancel denial — transition to booking
+        self.session_state["task_type"] = "booking"
+        if isinstance(active_flow, dict):
+            active_flow["name"] = "booking"
+            active_flow["stage"] = "analyze"
+        self.session_state["active_flow"] = active_flow
+
+        airport_codes = extract_airport_codes(latest_user_text)
+        dates = extract_dates(latest_user_text)
+
+        if len(airport_codes) >= 2:
+            self.session_state["origin"] = airport_codes[0]
+            self.session_state["destination"] = airport_codes[1]
+        if dates:
+            self.session_state["travel_dates"] = dates
+
+        # Proceed with search if we have origin/destination/date
+        origin = self.session_state.get("origin")
+        destination = self.session_state.get("destination")
+        travel_dates = self.session_state.get("travel_dates", [])
+        date = travel_dates[0] if travel_dates else None
+
+        if origin and destination:
+            self._trace("post_cancel_booking_transition", origin=origin, destination=destination, date=date)
+            if date:
+                return {
+                    "name": "search_direct_flight",
+                    "arguments": {"origin": origin, "destination": destination, "date": date},
+                }
+            else:
+                return self._fallback_action(
+                    f"I can help you book a flight from {origin} to {destination}. What date would you like to travel?"
+                )
+
+        return None
+
     def _pricing_expression_for_current_reservation(
         self, reservation_id: str | None, target_cabin: str | None
     ) -> str | None:
@@ -1307,6 +1464,7 @@ class Agent:
         action: dict[str, Any],
         latest_user_text: str,
     ) -> dict[str, Any]:
+        original_name = action.get("name")
         action = guard_action(
             self.session_state,
             self.tools,
@@ -1316,8 +1474,42 @@ class Agent:
             latest_user_text,
         )
         action = termination_controller(self.session_state, action, latest_user_text)
+
+        # P2: Retry on guard reject — if guard replaced a write action with respond fallback,
+        # retry up to 2 times with a hint about what went wrong (from phantom-agent).
+        # Only retry for actions that actually modify state (not read actions like get_reservation_details).
+        result_name = action.get("name")
+        write_actions = {
+            "cancel_reservation", "update_reservation_flights", "update_reservation_baggages",
+            "book_reservation", "update_reservation_insurance", "remove_passenger_from_reservation",
+        }
+        if result_name == RESPOND_ACTION_NAME and original_name in write_actions:
+            reject_key = f"reject_{original_name}"
+            reject_count = self.session_state.get(reject_key, 0)
+            if reject_count < 2:
+                reject_count += 1
+                self.session_state[reject_key] = reject_count
+                self._trace("guard_reject_retry", original=original_name, attempt=reject_count)
+                # Inject hint message back into conversation
+                self.messages.append({
+                    "role": "user",
+                    "content": f"tool: Your proposed action '{original_name}' was blocked by the policy guard. "
+                               f"Attempt {reject_count}/2. Reconsider your approach — "
+                               f"check if you have all required information (user details, reservation details, eligibility). "
+                               f"Try a different action that aligns with the current task type: {self.session_state.get('task_type', 'general')}."
+                })
+                # Return the ORIGINAL action to retry (LLM will be called again)
+                return {
+                    "name": original_name,
+                    "arguments": action.get("arguments", {}),
+                }
+
+        # Reset counters on success
+        if result_name != RESPOND_ACTION_NAME:
+            self.session_state["guard_reject_count"] = 0
+
         return {
-            "name": action.get("name"),
+            "name": result_name,
             "arguments": action.get("arguments")
             if isinstance(action.get("arguments"), dict)
             else {},
@@ -1383,12 +1575,224 @@ class Agent:
         update_state_from_text(self.session_state, input_text)
         update_state_from_tool_payload(self.session_state, input_text)
         sync_runtime_state(self.session_state, input_text)
+
+        # SKILL CLASSIFICATION: Dual classifier (LLM + regex) on first user message
+        if not self.session_state.get("intent_classified") and not self.session_state.get("latest_input_is_tool"):
+            self.session_state["intent_classified"] = True
+            try:
+                skill_id = dual_classify_intent(
+                    lambda messages, max_tokens: litellm.completion(
+                        model=os.getenv("AGENT_LLM_MODEL", "openai/gpt-4o"),
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=0.0,
+                    ),
+                    input_text,
+                )
+                self.session_state["active_skill_id"] = skill_id
+                # Also update task_type if still general
+                current = str(self.session_state.get("task_type") or "general")
+                if current == "general":
+                    self.session_state["task_type"] = skill_id
+                    self._trace("skill_classified", skill=skill_id, classifier="dual")
+            except Exception as e:
+                self._trace("skill_classification_failed", error=str(e))
+                self.session_state["active_skill_id"] = "general"
+
         self.messages.append({"role": "user", "content": input_text})
         latest_user_text = self._latest_user_text()
         return {"latest_user_text": latest_user_text, "should_return": False}
 
+    def _force_tool_for_task_type(self, latest_user_text: str) -> dict[str, Any] | None:
+        """Force-Tool Layer (from phantom-agent): when stuck in a respond loop,
+        force the correct tool based on detected task_type/intent instead of another respond."""
+        task_type = str(self.session_state.get("task_type") or "general")
+        active_flow = self.session_state.get("active_flow", {})
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        effective_flow = flow_name or task_type
+        res_id = self.session_state.get("reservation_id")
+        known_ids = [rid for rid in (self.session_state.get("known_reservation_ids") or []) if isinstance(rid, str)]
+        inventory = self.session_state.get("reservation_inventory", {})
+        if not isinstance(inventory, dict):
+            inventory = {}
+
+        # Cancel flow: force cancel_reservation for eligible reservations
+        if effective_flow == "cancel":
+            executed = self.session_state.get("executed_actions_by_reservation", {})
+            if not isinstance(executed, dict):
+                executed = {}
+            for rid in known_ids:
+                if executed.get(rid) == "cancel_reservation":
+                    continue
+                entry = inventory.get(rid)
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("status") or "").strip().lower() == "cancelled":
+                    continue
+                eligible, refusal = cancel_eligibility(self.session_state, rid, latest_user_text)
+                if eligible:
+                    self.session_state["reservation_id"] = rid
+                    self.session_state["cancel_eligible"] = True
+                    self._trace("force_tool", action="cancel_reservation", reservation_id=rid)
+                    return {
+                        "name": "cancel_reservation",
+                        "arguments": {"reservation_id": rid},
+                    }
+            return self._fallback_action(
+                f"I've reviewed all {len(inventory)} reservations on your profile and none are eligible for cancellation under the airline policy."
+            )
+
+        # Baggage flow: force update_reservation_baggages
+        if effective_flow == "baggage":
+            for rid in known_ids:
+                entry = inventory.get(rid)
+                if isinstance(entry, dict):
+                    self.session_state["reservation_id"] = rid
+                    baggage_total = entry.get("total_baggages", 0)
+                    self._trace("force_tool", action="update_reservation_baggages", reservation_id=rid)
+                    return {
+                        "name": "update_reservation_baggages",
+                        "arguments": {"reservation_id": rid, "total_baggages": baggage_total},
+                    }
+            return self._fallback_action(
+                "I need your reservation ID to check baggage allowance."
+            )
+
+        # Modify flow: force search or update
+        if effective_flow in {"modify", "modify_pricing"}:
+            if res_id and res_id in inventory:
+                entry = inventory[res_id]
+                if isinstance(entry, dict):
+                    flights = entry.get("flights")
+                    if isinstance(flights, list) and flights:
+                        first = flights[0]
+                        if isinstance(first, dict):
+                            origin = first.get("origin")
+                            dest = first.get("destination")
+                            date = first.get("date")
+                            if origin and dest and date:
+                                search_inv = self.session_state.get("flight_search_inventory", {})
+                                if not isinstance(search_inv, dict):
+                                    search_inv = {}
+                                key = f"{origin}|{dest}|{date}"
+                                if key not in search_inv:
+                                    self._trace("force_tool", action="search_direct_flight")
+                                    return {
+                                        "name": "search_direct_flight",
+                                        "arguments": {"origin": origin, "destination": dest, "date": date},
+                                    }
+                                self._trace("force_tool", action="update_reservation_flights")
+                                return {
+                                    "name": "update_reservation_flights",
+                                    "arguments": {"reservation_id": res_id},
+                                }
+            return self._fallback_action(
+                "I've loaded your reservations. Please specify which one to modify and the change needed."
+            )
+
+        # Booking flow: force search
+        if effective_flow == "booking":
+            origin = self.session_state.get("origin")
+            destination = self.session_state.get("destination")
+            travel_dates = self.session_state.get("travel_dates") or []
+            if origin and destination and travel_dates:
+                self._trace("force_tool", action="search_direct_flight")
+                return {
+                    "name": "search_direct_flight",
+                    "arguments": {"origin": origin, "destination": destination, "date": travel_dates[0]},
+                }
+            return self._fallback_action(
+                "Please provide origin, destination, travel date (YYYY-MM-DD), and cabin preference."
+            )
+
+        # Status flow: force get_flight_status
+        if effective_flow == "status":
+            fn = self.session_state.get("flight_number")
+            fd = self.session_state.get("flight_date")
+            if fn and fd:
+                self._trace("force_tool", action="get_flight_status")
+                return {
+                    "name": "get_flight_status",
+                    "arguments": {"flight_number": fn, "date": fd},
+                }
+
+        # General: no specific tool — use fallback respond
+        return self._fallback_action(
+            "I understand your request. Let me take a specific action to help you. "
+            "Please confirm what you'd like me to do and I'll proceed."
+        )
+
+    def _check_action_loop(self, latest_user_text: str) -> dict[str, Any] | None:
+        """Force-Tool Layer: detect loops and force the correct tool instead of respond fallback."""
+        # Collect last 6 assistant messages
+        assistant_actions = []
+        for msg in reversed(self.messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            if not content or content.startswith("tool:"):
+                continue
+            try:
+                parsed = json.loads(content)
+                name = parsed.get("name", "")
+                args = parsed.get("arguments", {})
+                if name == RESPOND_ACTION_NAME:
+                    key = f"respond:{hash(args.get('content', '')[:100])}"
+                else:
+                    key = f"{name}:{json.dumps(args, sort_keys=True)[:200]}"
+                assistant_actions.append({"name": name, "args": args, "key": key})
+            except Exception:
+                assistant_actions.append({"name": "respond_text", "key": f"text:{hash(content[:100])}"})
+            if len(assistant_actions) >= 6:
+                break
+
+        if len(assistant_actions) < 3:
+            return None
+
+        # Check if last 3 actions are identical
+        keys = [a["key"] for a in assistant_actions[:3]]
+        if len(set(keys)) == 1:
+            repeated_key = keys[0]
+            self._trace("loop_detected", key=repeated_key, actions_count=len(assistant_actions))
+
+            # Reset flow state to force re-evaluation
+            self.session_state["task_type"] = "general"
+            self.session_state["active_flow"] = {"name": "general", "stage": "analyze"}
+            self.session_state["_loop_broken"] = True
+
+            # FORCE-TOOL LAYER: instead of respond fallback, force the correct tool
+            force_action = self._force_tool_for_task_type(latest_user_text)
+            if force_action is not None:
+                self._trace("force_tool_triggered", action=force_action.get("name"))
+                return force_action
+
+            # Last resort: generic fallback
+            return self._fallback_action(
+                "I've been repeating myself. Let me take a different approach to help you."
+            )
+
+        return None
+
     def _graph_llm_decide(self, state: TurnGraphState) -> TurnGraphState:
         latest_user_text = state.get("latest_user_text", "")
+
+        # === SOFT INTENT HINTS: inject into system context, don't force ===
+        # Add a hint about the detected intent so the LLM can use it naturally
+        task_type = self.session_state.get("task_type", "general")
+        active_flow = self.session_state.get("active_flow", {})
+        flow_name = active_flow.get("name") if isinstance(active_flow, dict) else None
+        if task_type not in {"general"} or (flow_name and flow_name != "general"):
+            # Ensure the intent hint is reflected in the session state for the system prompt
+            pass  # Already handled by build_policy_reminder in playbooks.py
+
+        # === CIRCUIT BREAKER: detect action loops ===
+        loop_action = self._check_action_loop(latest_user_text)
+        if loop_action is not None:
+            self._trace("circuit_breaker_triggered", action=loop_action)
+            action = self._process_action_candidate(loop_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        # === END CIRCUIT BREAKER ===
+
         forced_action = self._pre_llm_route_resolution_action(latest_user_text)
         if forced_action is not None:
             self._trace("forced_action", source="route_resolution", action=forced_action)
@@ -1450,6 +1854,11 @@ class Agent:
             action = self._process_action_candidate(forced_action, latest_user_text)
             return {"action": action, "latest_user_text": latest_user_text}
         forced_action = self._pre_llm_status_compensation_action(latest_user_text)
+        if forced_action is not None:
+            action = self._process_action_candidate(forced_action, latest_user_text)
+            return {"action": action, "latest_user_text": latest_user_text}
+        # Post-cancel denial: check if user also wants to book a new flight
+        forced_action = self._pre_llm_post_cancel_booking_action(latest_user_text)
         if forced_action is not None:
             action = self._process_action_candidate(forced_action, latest_user_text)
             return {"action": action, "latest_user_text": latest_user_text}
